@@ -3,6 +3,7 @@
 //
 //   node server.js                    démarre le chat (PORT=3000 par défaut, HTTPS auto-signé)
 //   LANCHAT_HTTP=1 node server.js     HTTP simple, derrière un proxy HTTPS (Dokploy/Traefik, voir Dockerfile)
+//   DATABASE_URL=postgres://…         PostgreSQL (sinon SQLite dans DATA_DIR, sans rien installer)
 //   node server.js reset-user <nom>   supprime un compte (mot de passe oublié) pour qu'il puisse être recréé
 //
 // Sécurité :
@@ -20,17 +21,12 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
+const { openDb } = require('./db');
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const TLS_DIR = path.join(DATA_DIR, 'tls');
-const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl');
-const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
-const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
-const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const MAX_UPLOAD = 500 * 1024 * 1024; // 500 Mo
 const MAX_JSON = 2 * 1024 * 1024; // 2 Mo (un message chiffré est ~1,4× plus gros que le texte)
 const PAGE_SIZE = 100;
@@ -38,51 +34,28 @@ const NAME_RE = /^[\w.\-À-ÿ]{2,32}$/;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const readJsonFile = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
-function writeJsonFile(file, value, secret = false) {
-  fs.writeFileSync(file + '.tmp', JSON.stringify(value), secret ? { mode: 0o600 } : undefined);
-  fs.renameSync(file + '.tmp', file);
-}
 const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
 const lanIps = () => Object.values(os.networkInterfaces()).flat()
   .filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
 
-// ---------- Comptes, sessions, clés de canal ----------
-const users = readJsonFile(USERS_FILE, {});       // nom -> { authSalt, authHash, kdfSalt, pub, encPriv, created }
-const sessions = readJsonFile(SESSIONS_FILE, {}); // sha256(jeton) -> { user, created }
-const chanKeys = readJsonFile(KEYS_FILE, {});     // canal -> { destinataire -> { from, fromPub, wrapped } }
-const saveUsers = () => writeJsonFile(USERS_FILE, users, true);
-const saveSessions = () => writeJsonFile(SESSIONS_FILE, sessions, true);
-const saveKeys = () => writeJsonFile(KEYS_FILE, chanKeys, true);
-
-// Commande d'administration : node server.js reset-user <nom>
-if (process.argv[2] === 'reset-user') {
-  const name = process.argv[3];
-  if (!users[name]) { console.error(`Compte « ${name} » introuvable.`); process.exit(1); }
-  delete users[name];
-  for (const [h, s] of Object.entries(sessions)) if (s.user === name) delete sessions[h];
-  for (const ch of Object.keys(chanKeys)) delete chanKeys[ch][name];
-  saveUsers(); saveSessions(); saveKeys();
-  console.log(`Compte « ${name} » supprimé. Il peut être recréé ; ses anciens messages privés resteront illisibles pour lui.`);
-  process.exit(0);
-}
-
-const config = readJsonFile(CONFIG_FILE, {});
-if (!config.accessCode) {
-  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
-  const part = () => Array.from(crypto.randomBytes(4), b => alphabet[b % alphabet.length]).join('');
-  config.accessCode = `${part()}-${part()}`;
-  writeJsonFile(CONFIG_FILE, config, true);
-}
-const ACCESS_CODE = process.env.LANCHAT_CODE || config.accessCode;
+// ---------- Base de données (PostgreSQL si DATABASE_URL, sinon SQLite — voir db.js) ----------
+// Chargée en mémoire au démarrage par boot(), tout en bas du fichier.
+let db;
+let users = {};    // nom -> { authSalt, authHash, kdfSalt, pub, encPriv, created }
+let sessions = {}; // sha256(jeton) -> { user, created }
+let chanKeys = {}; // canal -> { destinataire -> { from, fromPub, wrapped } }
+let channels = [];
+let ACCESS_CODE = '';
 
 function hashAuthKey(authKey, salt) {
   return crypto.scryptSync(Buffer.from(String(authKey), 'base64'), Buffer.from(salt, 'base64'), 32).toString('base64');
 }
-function newSession(user) {
+async function newSession(user) {
   const token = crypto.randomBytes(32).toString('base64url');
-  sessions[sha256(token)] = { user, created: Date.now() };
-  saveSessions();
+  const hash = sha256(token);
+  const s = { user, created: Date.now() };
+  await db.saveSession(hash, s);
+  sessions[hash] = s;
   return token;
 }
 const sessionUser = token => (token && sessions[sha256(token)]?.user) || null;
@@ -101,12 +74,9 @@ function recordFailure(name) {
 }
 
 // ---------- Messages ----------
-let channels = readJsonFile(CHANNELS_FILE, ['general', 'code', 'liens']);
-const saveChannels = () => writeJsonFile(CHANNELS_FILE, channels);
-
 // Message : { id, channel, user, enc: { iv, ct }, file?: { id, size }, ts, parent?, broadcast?, edited?, reactions? }
 // (les anciens messages d'avant le chiffrement ont un champ `text` en clair)
-// Le journal (JSONL) contient des messages et des opérations { op: 'delete' | 'edit' | 'react', ... }.
+// Tout est en mémoire pour la rapidité ; chaque changement est écrit aussitôt dans la base.
 const messages = [];
 const byId = new Map();
 const replies = new Map(); // id du parent -> [réponses]
@@ -135,39 +105,10 @@ function toggleReaction(m, emoji, user) {
   if (!m.reactions[emoji].length) delete m.reactions[emoji];
   if (!Object.keys(m.reactions).length) delete m.reactions;
 }
-function applyEdit(m, o) {
-  if (o.enc) { m.enc = o.enc; delete m.text; } else m.text = o.text;
-  m.edited = o.ts;
-}
-function applyOp(o) {
-  const m = byId.get(o.id);
-  if (!m) return;
-  if (o.op === 'delete') removeFromIndex(m);
-  else if (o.op === 'edit') applyEdit(m, o);
-  else if (o.op === 'react') toggleReaction(m, o.emoji, o.user);
-}
-if (fs.existsSync(MESSAGES_FILE)) {
-  for (const line of fs.readFileSync(MESSAGES_FILE, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const o = JSON.parse(line);
-      if (o.op) applyOp(o); else addToIndex(o);
-    } catch {}
-  }
-}
-let nextId = messages.reduce((max, m) => Math.max(max, m.id), 0) + 1;
-const appendLog = obj => fs.appendFileSync(MESSAGES_FILE, JSON.stringify(obj) + '\n');
+let nextId = 1;
 
 // Fichiers envoyés mais pas encore rattachés à un message : id -> { user, size, ts }
 const pendingFiles = new Map();
-// Ménage au démarrage : fichiers orphelins (envoi interrompu) de plus d'une heure
-{
-  const used = new Set(messages.filter(m => m.file).map(m => m.file.id));
-  for (const f of fs.readdirSync(UPLOAD_DIR)) {
-    const p = path.join(UPLOAD_DIR, f);
-    if (!used.has(f) && Date.now() - fs.statSync(p).mtimeMs > 3600e3) fs.rmSync(p, { force: true });
-  }
-}
 
 // Ajoute le résumé du fil (nombre de réponses, participants, dernière réponse) à un message.
 function out(m) {
@@ -199,9 +140,10 @@ function broadcast(event, data, channel) {
   for (const c of clients) if (!channel || canSee(c.user, channel)) send(c, event, data);
 }
 // Publie un nouveau message (et la mise à jour du résumé de fil de son parent).
-function publish(msg) {
+async function publish(msg) {
+  // Le dernier identifiant attribué est mémorisé : un message supprimé ne voit jamais son id réutilisé.
+  await db.batch([db.S.insertMessage(msg), db.S.setConfig('lastId', msg.id)]);
   addToIndex(msg);
-  appendLog(msg);
   const payload = msg.parent ? { ...msg, participants: participants(msg.parent) } : msg;
   broadcast('message', payload, msg.channel);
   if (msg.parent && byId.has(msg.parent)) broadcast('update', out(byId.get(msg.parent)), msg.channel);
@@ -259,8 +201,11 @@ async function handle(req, res) {
   const token = (req.headers.authorization || '').replace(/^Bearer /, '') || url.searchParams.get('token');
   const me = sessionUser(token);
 
-  // Sonde de santé (Docker / Dokploy)
-  if (p === '/api/health') return json(res, 200, { ok: true });
+  // Sonde de santé (Docker / Dokploy) : vérifie aussi la base
+  if (p === '/api/health') {
+    try { await db.ping(); return json(res, 200, { ok: true }); }
+    catch { return json(res, 503, { ok: false, error: 'Base de données injoignable' }); }
+  }
 
   // ----- Routes publiques : authentification -----
   if (p === '/api/prelogin' && req.method === 'GET') {
@@ -281,10 +226,11 @@ async function handle(req, res) {
       return json(res, 400, { error: 'Données de compte invalides' });
     }
     const authSalt = crypto.randomBytes(16).toString('base64');
-    users[name] = { authSalt, authHash: hashAuthKey(body.authKey, authSalt), kdfSalt: body.kdfSalt, pub: body.pub, encPriv: body.encPriv, created: Date.now() };
-    saveUsers();
+    const account = { authSalt, authHash: hashAuthKey(body.authKey, authSalt), kdfSalt: body.kdfSalt, pub: body.pub, encPriv: body.encPriv, created: Date.now() };
+    await db.saveUser(name, account);
+    users[name] = account;
     broadcast('user', { name, pub: body.pub });
-    return json(res, 201, { token: newSession(name), name });
+    return json(res, 201, { token: await newSession(name), name });
   }
 
   if (p === '/api/login' && req.method === 'POST') {
@@ -297,7 +243,7 @@ async function handle(req, res) {
       crypto.timingSafeEqual(Buffer.from(hashAuthKey(body.authKey, u.authSalt)), Buffer.from(u.authHash));
     if (!ok) { recordFailure(name); return json(res, 401, { error: 'Pseudo ou mot de passe incorrect' }); }
     failures.delete(name);
-    return json(res, 200, { token: newSession(name), name, pub: u.pub, encPriv: u.encPriv });
+    return json(res, 200, { token: await newSession(name), name, pub: u.pub, encPriv: u.encPriv });
   }
 
   // ----- Fichiers statiques (l'application elle-même) -----
@@ -315,8 +261,8 @@ async function handle(req, res) {
   if (!me || !users[me]) return json(res, 401, { error: 'Session expirée, reconnecte-toi' });
 
   if (p === '/api/logout' && req.method === 'POST') {
+    await db.deleteSession(sha256(token));
     delete sessions[sha256(token)];
-    saveSessions();
     return json(res, 200, { ok: true });
   }
 
@@ -361,12 +307,12 @@ async function handle(req, res) {
     // Seul un détenteur de la clé peut la partager ; le premier à créer la clé doit se l'inclure.
     if (existing.length && !existing.includes(me)) return json(res, 409, { error: 'La clé de ce canal existe déjà', holders: existing });
     if (!existing.length && !(body.keys || {})[me]) return json(res, 400, { error: 'La clé doit inclure son créateur' });
+    const added = Object.entries(body.keys || {})
+      .filter(([to, wrapped]) => users[to] && !chanKeys[ch]?.[to] && validEnc(wrapped)) // jamais d'écrasement
+      .map(([to, wrapped]) => [to, { from: me, fromPub: users[me].pub, wrapped }]);
+    await db.batch(added.map(([to, e]) => db.S.saveKey(ch, to, e)));
     chanKeys[ch] = chanKeys[ch] || {};
-    for (const [to, wrapped] of Object.entries(body.keys || {})) {
-      if (!users[to] || chanKeys[ch][to] || !validEnc(wrapped)) continue; // jamais d'écrasement
-      chanKeys[ch][to] = { from: me, fromPub: users[me].pub, wrapped };
-    }
-    saveKeys();
+    for (const [to, e] of added) chanKeys[ch][to] = e;
     broadcast('keys', { channel: ch, holders: keyHolders(ch) });
     return json(res, 200, { holders: keyHolders(ch) });
   }
@@ -426,7 +372,7 @@ async function handle(req, res) {
       msg.file = { id: body.fileId, size: f.size };
     }
     if (body.parent) { msg.parent = Number(body.parent); if (body.broadcast) msg.broadcast = true; }
-    publish(msg);
+    await publish(msg);
     return json(res, 201, msg);
   }
 
@@ -441,7 +387,7 @@ async function handle(req, res) {
       const emoji = String(body.emoji || '').slice(0, 16);
       if (!emoji) return json(res, 400, { error: 'Réaction invalide' });
       toggleReaction(msg, emoji, me);
-      appendLog({ op: 'react', id: msg.id, emoji, user: me });
+      await db.updateMessage(msg);
       broadcast('update', out(msg), msg.channel);
       return json(res, 200, out(msg));
     }
@@ -450,9 +396,10 @@ async function handle(req, res) {
       const body = await readJson(req);
       if (msg.user !== me) return json(res, 403, { error: 'Ce n\'est pas ton message' });
       if (!validEnc(body.enc)) return json(res, 400, { error: 'Message non chiffré refusé' });
-      const op = { op: 'edit', id: msg.id, enc: { iv: body.enc.iv, ct: body.enc.ct }, ts: Date.now() };
-      applyEdit(msg, op);
-      appendLog(op);
+      msg.enc = { iv: body.enc.iv, ct: body.enc.ct };
+      delete msg.text; // un ancien message en clair devient chiffré une fois modifié
+      msg.edited = Date.now();
+      await db.updateMessage(msg);
       broadcast('update', out(msg), msg.channel);
       return json(res, 200, out(msg));
     }
@@ -460,9 +407,10 @@ async function handle(req, res) {
     if (!one[2] && req.method === 'DELETE') {
       if (msg.user !== me) return json(res, 403, { error: 'Ce n\'est pas ton message' });
       // Supprimer un message racine supprime aussi son fil
-      for (const m of [...(replies.get(msg.id) || []), msg]) {
+      const doomed = [...(replies.get(msg.id) || []), msg];
+      await db.batch(doomed.map(m => db.S.deleteMessage(m.id)));
+      for (const m of doomed) {
         removeFromIndex(m);
-        appendLog({ op: 'delete', id: m.id });
         if (m.file) fs.rm(path.join(UPLOAD_DIR, m.file.id), () => {});
         broadcast('delete', { id: m.id, channel: m.channel, parent: m.parent || null }, m.channel);
       }
@@ -487,8 +435,8 @@ async function handle(req, res) {
     const name = String(body.name || '').toLowerCase().trim().replace(/[^a-z0-9\-_]/g, '-').replace(/-+/g, '-').slice(0, 40);
     if (!name || name === '-') return json(res, 400, { error: 'Nom invalide' });
     if (!channels.includes(name)) {
+      await db.saveChannel(name);
       channels.push(name);
-      saveChannels();
       broadcast('channels', { channels });
     }
     return json(res, 201, { name });
@@ -590,7 +538,45 @@ if (tls) {
   server.requestTimeout = 0;
 }
 
-server.listen(PORT, '0.0.0.0', () => {
+// ---------- Démarrage ----------
+async function boot() {
+  db = await openDb({ dataDir: DATA_DIR, url: process.env.DATABASE_URL });
+
+  // Commande d'administration : node server.js reset-user <nom>
+  if (process.argv[2] === 'reset-user') {
+    const name = process.argv[3];
+    const loaded = await db.load();
+    if (!loaded.users[name]) { console.error(`Compte « ${name} » introuvable.`); process.exit(1); }
+    await db.deleteUser(name); // ses sessions et les clés de canal qu'il avait reçues partent avec (cascade)
+    console.log(`Compte « ${name} » supprimé. Il peut être recréé ; ses anciens messages privés resteront illisibles pour lui.`);
+    console.log('Redémarre le serveur pour que la suppression soit prise en compte.');
+    await db.close();
+    process.exit(0);
+  }
+
+  if (!(await db.getConfig('accessCode'))) {
+    const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+    const part = () => Array.from(crypto.randomBytes(4), b => alphabet[b % alphabet.length]).join('');
+    await db.setConfig('accessCode', `${part()}-${part()}`);
+  }
+  ACCESS_CODE = process.env.LANCHAT_CODE || await db.getConfig('accessCode');
+
+  const loaded = await db.load();
+  ({ users, sessions, chanKeys, channels } = loaded);
+  loaded.messages.forEach(addToIndex);
+  nextId = Math.max(messages.reduce((max, m) => Math.max(max, m.id), 0), Number(await db.getConfig('lastId')) || 0) + 1;
+
+  // Ménage : fichiers orphelins (envoi interrompu) de plus d'une heure
+  const used = new Set(messages.filter(m => m.file).map(m => m.file.id));
+  for (const f of fs.readdirSync(UPLOAD_DIR)) {
+    const p = path.join(UPLOAD_DIR, f);
+    if (!used.has(f) && Date.now() - fs.statSync(p).mtimeMs > 3600e3) fs.rmSync(p, { force: true });
+  }
+
+  server.listen(PORT, '0.0.0.0', onListening);
+}
+
+function onListening() {
   const scheme = tls ? 'https' : 'http';
   console.log('\n  💬 LAN Chat démarré\n');
   console.log(`  Sur cette machine  : ${scheme}://localhost:${PORT}`);
@@ -605,5 +591,7 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('\n  ⚠️  HTTPS indisponible (openssl introuvable) : le chiffrement de bout en bout ne fonctionnera');
     console.log('     que sur http://localhost. Installe openssl, ou place cert.pem et key.pem dans data/tls/.');
   }
-  console.log(`\n  Données : ${DATA_DIR}\n`);
-});
+  console.log(`\n  Base de données : ${db.label}\n`);
+}
+
+boot().catch(err => { console.error('\n  Démarrage impossible :', err.message, '\n'); process.exit(1); });

@@ -1,9 +1,10 @@
 {
   "name": "lan-chat",
-  "version": "1.0.0",
-  "description": "Petit chat façon Slack pour le réseau local du bureau (zéro dépendance)",
+  "version": "2.0.0",
+  "description": "Chat façon Slack pour le bureau, chiffré de bout en bout",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=22.13" },
+  "dependencies": { "pg": "^8.23.1" },
   "license": "MIT"
 }

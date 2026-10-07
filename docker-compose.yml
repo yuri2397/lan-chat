@@ -1,17 +1,40 @@
-# Déploiement Dokploy en mode « Docker Compose » (voir README, section Déployer sur Dokploy).
-# Le domaine et le certificat HTTPS se configurent dans l'onglet « Domains » de Dokploy (port du conteneur : 3000).
-# Aucun port n'est publié sur l'hôte : tout passe par Traefik, en HTTPS.
+# LAN Chat + PostgreSQL — déploiement Dokploy en mode « Docker Compose » (voir README).
+# Le domaine et le certificat HTTPS se configurent dans l'onglet « Domains » de Dokploy
+# (service « lanchat », port du conteneur : 3000). Aucun port n'est publié sur l'hôte.
+#
+# Variables à définir dans Dokploy (onglet Environment) :
+#   POSTGRES_PASSWORD   mot de passe de la base (obligatoire, long et aléatoire)
+#   LANCHAT_CODE        code demandé pour créer un compte (vide = généré, affiché dans les logs)
 services:
   lanchat:
     build: .
     restart: unless-stopped
     environment:
-      # Code demandé pour créer un compte. Vide = généré au premier démarrage et affiché dans les logs.
+      DATABASE_URL: postgres://lanchat:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD manquant}@postgres:5432/lanchat
       LANCHAT_CODE: ${LANCHAT_CODE:-}
     volumes:
-      - lanchat-data:/data
+      - lanchat-files:/data
     expose:
       - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lanchat
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD manquant}
+      POSTGRES_DB: lanchat
+    volumes:
+      - lanchat-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lanchat -d lanchat"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
-  lanchat-data:
+  lanchat-files:
+  lanchat-db:
