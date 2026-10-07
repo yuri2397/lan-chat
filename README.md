@@ -16,11 +16,24 @@ Le terminal affiche l'adresse à partager, ex. `http://192.168.1.15:3000`. Les c
 
 ## Fonctionnalités
 
+**Discussions**
 - Canaux (`#general`, `#code`, `#liens` + création libre) et messages directs
-- Blocs de code ```` ```js ```` avec coloration et bouton **Copier**, `code inline`, **gras**, liens cliquables, `@mentions` (`@tous` pour tout le monde)
+- **Fils de discussion** façon Slack : survoler un message → 💬 « Répondre dans un fil », panneau latéral, option « Aussi dans #canal », vue « Fils de discussion » qui regroupe tous les fils auxquels tu participes
+- **Réactions emoji** (✅ 👀 🙌 en un clic, ou le sélecteur complet avec recherche en français)
+- Modifier (`↑` dans une zone vide pour modifier ton dernier message) et supprimer ses messages
+- « Awa est en train d'écrire… », ligne « Nouveaux » sur les messages non lus, pastille « ↓ nouveaux messages »
+
+**Écrire**
+- Blocs de code ```` ```js ```` avec coloration et bouton **Copier**, `code inline`, **gras**, _italique_, ~barré~, `> citation`, liens cliquables
+- Autocomplétion : `@` pour mentionner (`@tous` pour tout le monde), `:feu` pour les emoji, `/` pour les commandes
+- Commandes : `/shrug`, `/flip`, `/unflip`, `/lenny`, `/code`, et `/party` qui envoie des confettis à tout le monde 🎉
 - Fichiers jusqu'à 500 Mo : bouton 📎, glisser-déposer, ou coller (Cmd+V une capture d'écran) — aperçu des images/vidéos
-- Présence en ligne, compteurs de non-lus, notifications du navigateur, recherche, suppression de ses messages
-- Historique conservé dans `data/` (messages en JSONL + fichiers dans `data/uploads/`)
+
+**Le reste**
+- Présence en ligne, compteurs de non-lus, notifications du navigateur + son (coupable 🔕), recherche
+- `⌘K` / `Ctrl+K` pour sauter vers un canal ou une personne
+- Thème clair / sombre / automatique, version mobile
+- Historique conservé dans `data/` (journal JSONL + fichiers dans `data/uploads/`)
 
 ## Limites (assumées)
 
