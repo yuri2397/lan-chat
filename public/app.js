@@ -6,7 +6,10 @@ const store = {
   set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
 };
 const state = {
-  me: store.get('lanchat:user') || '',
+  me: '', token: '', priv: null, pub: '',  // session (voir begin())
+  users: new Map(),         // annuaire : nom -> clé publique
+  chKeys: new Map(),        // canal -> { raw, key } (clé AES du canal, en mémoire seulement)
+  holders: {},              // canal -> membres qui ont reçu la clé
   channels: [], dms: new Set(), online: [], known: new Set(),
   current: store.get('lanchat:channel') || 'general',
   view: 'channel',          // 'channel' | 'threads' | 'search'
@@ -53,8 +56,9 @@ function toast(text, onClick) {
   document.body.appendChild(t); setTimeout(() => t.remove(), onClick ? 5000 : 2200);
 }
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + state.token, ...(opts.headers || {}) } });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && state.token) logout('Session expirée, reconnecte-toi.');
   if (!res.ok) throw new Error(data.error || 'Erreur ' + res.status);
   return data;
 }
@@ -75,6 +79,124 @@ const knownUsers = () => {
   for (const ch of state.dms) state.known.add(dmOther(ch));
   return [...state.known].filter(u => u && u !== state.me).sort((a, b) => a.localeCompare(b));
 };
+
+// ---------- Chiffrement de bout en bout (voir crypto.js) ----------
+async function loadUsers() {
+  const { users } = await api('/api/users');
+  state.users = new Map(users.map(u => [u.name, u.pub]));
+  users.forEach(u => state.known.add(u.name));
+}
+// Récupère les clés de canal qui nous ont été partagées et les déchiffre ; renvoie les canaux nouvellement obtenus.
+async function loadKeys() {
+  const { mine, holders } = await api('/api/keys');
+  state.holders = holders;
+  const added = [];
+  for (const [ch, entry] of Object.entries(mine)) {
+    if (state.chKeys.has(ch)) continue;
+    try { state.chKeys.set(ch, await E2E.unwrapChannelKey(state.priv, entry.wrapped, entry.fromPub, ch)); added.push(ch); }
+    catch { console.warn('Clé illisible pour #' + ch); }
+  }
+  return added;
+}
+async function keyFor(ch) {
+  if (isDm(ch)) {
+    const pub = state.users.get(dmOther(ch));
+    return pub ? E2E.dmKey(state.priv, pub, ch) : null;
+  }
+  return state.chKeys.get(ch)?.key || null;
+}
+// Le premier membre qui ouvre un canal sans clé la crée et la chiffre pour tous les comptes existants.
+async function ensureChannelKey(ch) {
+  if (isDm(ch) || state.chKeys.has(ch) || (state.holders[ch] || []).length) return;
+  const ck = await E2E.newChannelKey();
+  const keys = {};
+  for (const [u, pub] of state.users) keys[u] = await E2E.wrapChannelKey(state.priv, ck.raw, pub, ch);
+  try {
+    const r = await api('/api/keys', { method: 'POST', body: JSON.stringify({ channel: ch, keys }) });
+    state.chKeys.set(ch, ck);
+    state.holders[ch] = r.holders;
+  } catch { await loadKeys(); } // quelqu'un l'a créée en même temps : on récupère la sienne
+}
+// Partage automatiquement les clés qu'on détient avec les comptes qui ne les ont pas encore (nouveaux arrivants).
+let shareTimer;
+function scheduleShare() { clearTimeout(shareTimer); shareTimer = setTimeout(shareMissing, 300 + Math.random() * 1200); }
+async function shareMissing() {
+  for (const [ch, ck] of state.chKeys) {
+    const have = new Set(state.holders[ch] || []);
+    const missing = [...state.users].filter(([u]) => !have.has(u));
+    if (!missing.length) continue;
+    const keys = {};
+    for (const [u, pub] of missing) keys[u] = await E2E.wrapChannelKey(state.priv, ck.raw, pub, ch);
+    try { state.holders[ch] = (await api('/api/keys', { method: 'POST', body: JSON.stringify({ channel: ch, keys }) })).holders; } catch {}
+  }
+}
+function onKeyArrived(ch) {
+  delete state.cache[ch];
+  updateKeyWait();
+  if (state.view === 'channel' && state.current === ch) openChannel(ch);
+  if (state.thread && state.thread.channel === ch) openThread(state.thread.id);
+  if (state.view === 'threads') renderThreadsView();
+  toast(`🔑 Clé de chiffrement de #${ch} reçue`);
+}
+// Déchiffre un message reçu du serveur (en place). Les anciens messages d'avant le chiffrement sont marqués `legacy`.
+async function decryptMsg(m) {
+  if (!m.enc) { m.legacy = true; return m; }
+  try {
+    const key = await keyFor(m.channel);
+    if (!key) throw new Error('clé manquante');
+    const p = await E2E.decryptPayload(key, m.enc, m.channel);
+    m.text = p.text || '';
+    if (m.file && p.file) m.file = { ...m.file, ...p.file, e2e: true };
+    m.locked = false;
+  } catch { m.text = ''; m.locked = true; }
+  return m;
+}
+const decryptAll = list => Promise.all(list.map(decryptMsg));
+const fileMeta = f => ({ name: f.name, type: f.type, size: f.size, iv: f.iv });
+function updateKeyWait() {
+  const ch = state.current, el = $('#keyWait');
+  let msg = '';
+  if (state.view === 'channel') {
+    if (isDm(ch)) { if (!state.users.has(dmOther(ch))) msg = `${dmOther(ch)} n'a pas encore de compte : impossible de lui écrire en chiffré.`; }
+    else if (!state.chKeys.has(ch)) msg = `En attente de la clé de chiffrement de #${ch}. Elle te sera transmise automatiquement dès qu'un membre du canal sera connecté.`;
+  }
+  el.hidden = !msg;
+  el.innerHTML = msg ? `${icon('key')}<span>${esc(msg)}</span>` : '';
+}
+// Fichiers chiffrés : téléchargés, déchiffrés dans le navigateur, puis affichés via une URL blob:
+const fileUrls = new Map();
+function fileUrl(m) {
+  const f = m.file;
+  if (!fileUrls.has(f.id)) {
+    const p = (async () => {
+      const res = await fetch(`/files/${f.id}`, { headers: { Authorization: 'Bearer ' + state.token } });
+      if (!res.ok) throw new Error('Fichier introuvable');
+      const key = await keyFor(m.channel);
+      if (!key) throw new Error('Clé de chiffrement indisponible');
+      const plain = await E2E.decryptFile(key, f.iv, await res.arrayBuffer(), m.channel);
+      return URL.createObjectURL(new Blob([plain], { type: f.type || 'application/octet-stream' }));
+    })();
+    p.catch(() => fileUrls.delete(f.id));
+    fileUrls.set(f.id, p);
+  }
+  return fileUrls.get(f.id);
+}
+async function downloadFile(m) {
+  toast(`Déchiffrement de ${m.file.name}…`);
+  try {
+    const a = document.createElement('a');
+    a.href = await fileUrl(m); a.download = m.file.name;
+    document.body.appendChild(a); a.click(); a.remove();
+  } catch (e) { toast(e.message); }
+}
+// Les aperçus d'images/vidéos chiffrées se chargent dès qu'ils apparaissent à l'écran
+new MutationObserver(() => {
+  document.querySelectorAll('[data-encfile]:not([data-loading])').forEach(async el => {
+    el.dataset.loading = '1';
+    const m = el.closest('.msg')?._msg;
+    if (m?.file) try { el.src = await fileUrl(m); } catch {}
+  });
+}).observe(document.body, { childList: true, subtree: true });
 
 // ---------- Thème & son ----------
 const THEMES = ['auto', 'light', 'dark'];
@@ -219,16 +341,24 @@ const FILE_KINDS = [
   [['js', 'ts', 'php', 'py', 'java', 'dart', 'json', 'sql', 'html', 'css', 'vue', 'sh', 'go', 'rs'], '#5b5bd6'],
 ];
 function renderFile(f) {
-  const url = `/files/${f.id}/${encodeURIComponent(f.name)}`;
-  const ext = f.name.includes('.') ? f.name.split('.').pop().toLowerCase() : '';
+  const name = f.name || 'fichier';
+  const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
   const color = (FILE_KINDS.find(([exts]) => exts.includes(ext)) || [0, '#6e6e80'])[1];
-  let preview = '';
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) preview = `<div class="preview"><img src="${url}" alt="${esc(f.name)}" loading="lazy" data-zoom></div>`;
-  else if (['mp4', 'webm'].includes(ext)) preview = `<div class="preview"><video src="${url}" controls preload="metadata"></video></div>`;
-  return preview + `<a class="file" href="${url}?dl=1" download="${esc(f.name)}">
+  const isImg = ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext), isVideo = ['mp4', 'webm'].includes(ext);
+  const card = attrs => `<a class="file" ${attrs}>
     <span class="tile" style="background:${color}">${esc(ext.slice(0, 4) || 'file')}</span>
-    <span class="finfo"><span class="fname">${esc(f.name)}</span><small>${fmtSize(f.size)}</small></span>
+    <span class="finfo"><span class="fname">${esc(name)}</span><small>${fmtSize(f.size)}${f.e2e ? ' · 🔒 chiffré' : ''}</small></span>
     <span class="dl">${icon('download')}</span></a>`;
+  if (f.e2e) {
+    const preview = isImg ? `<div class="preview"><img data-encfile="${f.id}" alt="${esc(name)}" data-zoom></div>` :
+      isVideo ? `<div class="preview"><video data-encfile="${f.id}" controls preload="metadata"></video></div>` : '';
+    return preview + card('href="#" data-download');
+  }
+  // Ancien fichier envoyé avant le chiffrement (en clair sur le serveur)
+  const url = `/files/${f.id}/${encodeURIComponent(name)}?${qs({ token: state.token })}`;
+  const preview = isImg ? `<div class="preview"><img src="${url}" alt="${esc(name)}" loading="lazy" data-zoom></div>` :
+    isVideo ? `<div class="preview"><video src="${url}" controls preload="metadata"></video></div>` : '';
+  return preview + card(`href="${url}&dl=1" download="${esc(name)}"`);
 }
 function avatarHtml(name, online) {
   return `<span class="av" style="background:${colorOf(name)}" title="${esc(name)}">${initial(name)}${online === undefined ? '' : `<span class="pres ${online ? 'on' : ''}"></span>`}</span>`;
@@ -250,6 +380,7 @@ function threadSumHtml(m) {
 
 // Texte du message, avec « (modifié) » collé à la fin du dernier paragraphe
 function bodyHtml(m) {
+  if (m.locked) return `<p class="locked">${icon('lock')} Message chiffré — la clé n'est pas encore disponible sur ce poste</p>`;
   const html = m.text ? renderText(m.text) : '';
   if (!m.edited) return html;
   const tag = `<span class="edited" title="${new Date(m.edited).toLocaleString('fr-FR')}">(modifié)</span>`;
@@ -268,7 +399,7 @@ function renderMessage(m, prev, opts = {}) {
   el.innerHTML = `
     ${cont ? `<div class="gutter">${fmtTime(m.ts)}</div>` : `<div class="avatar" style="background:${colorOf(m.user)}">${initial(m.user)}</div>`}
     <div class="content">
-      ${cont ? '' : `<div class="meta"><b>${esc(m.user)}</b>${mine ? '<span class="you">toi</span>' : ''}<time title="${new Date(m.ts).toLocaleString('fr-FR')}">${fmtTime(m.ts)}</time></div>`}
+      ${cont ? '' : `<div class="meta"><b>${esc(m.user)}</b>${mine ? '<span class="you">toi</span>' : ''}${m.legacy ? '<span class="legacy" title="Envoyé avant l\'activation du chiffrement">non chiffré</span>' : ''}<time title="${new Date(m.ts).toLocaleString('fr-FR')}">${fmtTime(m.ts)}</time></div>`}
       ${m.broadcast && !opts.inThread ? `<div class="bc-label">a répondu dans <a data-act="open-parent">un fil</a></div>` : ''}
       <div class="body${isEmojiOnly(m.text) && !m.file ? ' jumbo' : ''}">${bodyHtml(m)}${m.file ? renderFile(m.file) : ''}</div>
       ${reactionsHtml(m)}
@@ -301,7 +432,7 @@ function refreshMsg(m) {
 
 // ---------- Barre latérale & en-tête ----------
 function people() {
-  const set = new Set(state.online.filter(u => u !== state.me));
+  const set = new Set([...state.online, ...state.users.keys()].filter(u => u !== state.me));
   for (const ch of state.dms) set.add(dmOther(ch));
   return [...set].sort((a, b) => a.localeCompare(b));
 }
@@ -347,9 +478,9 @@ function renderTopbar() {
   const ch = state.current;
   if (isDm(ch)) {
     const u = dmOther(ch), on = state.online.includes(u);
-    setTopbar(`${initial(u)}<span class="pres ${on ? 'on' : ''}"></span>`, u, on ? 'En ligne' : 'Hors ligne', u);
+    setTopbar(`${initial(u)}<span class="pres ${on ? 'on' : ''}"></span>`, u, `${on ? 'En ligne' : 'Hors ligne'} · 🔒 Chiffré de bout en bout`, u);
   } else {
-    setTopbar('#', ch, plural(state.online.length, 'personne en ligne', 'personnes en ligne'));
+    setTopbar('#', ch, `${plural(state.online.length, 'personne en ligne', 'personnes en ligne')} · 🔒 Chiffré de bout en bout`);
   }
 }
 function introEl() {
@@ -358,10 +489,14 @@ function introEl() {
   if (isDm(ch)) {
     const u = dmOther(ch);
     el.innerHTML = `<div class="big av" style="background:${colorOf(u)}">${initial(u)}</div>
-      <h3>${esc(u)}</h3><p>Début de ta conversation privée avec <b>${esc(u)}</b>. Partage du code, des liens ou des fichiers.</p>`;
+      <h3>${esc(u)}</h3><p>Début de ta conversation privée avec <b>${esc(u)}</b>, chiffrée de bout en bout : seuls vous deux pouvez la lire.</p>
+      <p class="safety">${icon('lock')}<span>Code de sécurité : <code>…</code><br>Comparez-le de vive voix : s'il est identique chez vous deux, personne ne s'est glissé entre vous.</span></p>`;
+    const pub = state.users.get(u);
+    if (pub) E2E.safetyNumber(state.pub, pub).then(n => { el.querySelector('.safety code').textContent = n; });
+    else el.querySelector('.safety span').textContent = `${u} n'a pas encore de compte.`;
   } else {
     el.innerHTML = `<div class="big">#</div><h3>Bienvenue dans #${esc(ch)}</h3>
-      <p>C'est le tout début du canal <b>#${esc(ch)}</b>. Tout le monde sur le réseau peut le lire. Mentionne <b>@tous</b> pour notifier tout le monde, et survole un message pour y répondre dans un fil.</p>`;
+      <p>C'est le tout début du canal <b>#${esc(ch)}</b>. Les messages sont chiffrés de bout en bout : même le serveur ne peut pas les lire. Mentionne <b>@tous</b> pour notifier tout le monde, et survole un message pour y répondre dans un fil.</p>`;
   }
   return el;
 }
@@ -428,6 +563,7 @@ function markRead(ch, id) {
 function setView(view) {
   state.view = view;
   $('#mainComposer').hidden = view !== 'channel';
+  if (view !== 'channel') $('#keyWait').hidden = true;
   $('#app').classList.remove('open');
 }
 async function openChannel(ch) {
@@ -442,10 +578,15 @@ async function openChannel(ch) {
   mainComposer.setPlaceholder(`Message ${isDm(ch) ? 'à ' + dmOther(ch) : '#' + ch}`);
   renderSidebar();
   renderTyping();
+  if (!isDm(ch)) await ensureChannelKey(ch).catch(() => {});
+  updateKeyWait();
   if (!state.cache[ch]) {
     $('#msgs').innerHTML = '';
-    try { state.cache[ch] = await api(`/api/messages?${qs({ channel: ch, user: state.me })}`); }
-    catch (e) { return toast(e.message); }
+    try {
+      const data = await api(`/api/messages?${qs({ channel: ch })}`);
+      await decryptAll(data.messages);
+      state.cache[ch] = data;
+    } catch (e) { return toast(e.message); }
   }
   if (state.current !== ch || state.view !== 'channel') return;
   renderMessages();
@@ -456,20 +597,27 @@ async function openChannel(ch) {
 async function loadOlder() {
   const data = state.cache[state.current];
   const first = data.messages[0];
-  const older = await api(`/api/messages?${qs({ channel: state.current, user: state.me, before: first ? first.id : '' })}`);
+  const older = await api(`/api/messages?${qs({ channel: state.current, before: first ? first.id : '' })}`);
+  await decryptAll(older.messages);
   data.messages = [...older.messages, ...data.messages];
   data.hasMore = older.hasMore;
   renderMessages({ keepScroll: true });
 }
 
 // Recherche
-let searchTimer;
+let searchTimer, searchCache = null;
 $('#search').addEventListener('input', e => {
   clearTimeout(searchTimer);
   const q = e.target.value.trim();
   if (!q) { if (state.view === 'search') openChannel(state.current); return; }
   searchTimer = setTimeout(async () => {
-    const { messages } = await api(`/api/search?${qs({ q, user: state.me })}`);
+    // Le serveur ne peut pas chercher dans des messages chiffrés : on déchiffre l'historique récent ici
+    if (!searchCache || Date.now() - searchCache.ts > 30000) {
+      const { messages: all } = await api('/api/all');
+      searchCache = { ts: Date.now(), messages: await decryptAll(all) };
+    }
+    const ql = q.toLowerCase();
+    const messages = searchCache.messages.filter(m => (m.text || '').toLowerCase().includes(ql) || (m.file?.name || '').toLowerCase().includes(ql)).reverse().slice(0, 50);
     setView('search');
     renderSidebar();
     setTopbar(icon('search'), `« ${q} »`, plural(messages.length, 'résultat', 'résultats'));
@@ -497,7 +645,8 @@ async function openThreadsView() {
   await renderThreadsView();
 }
 async function renderThreadsView() {
-  const { threads } = await api(`/api/threads?${qs({ user: state.me })}`);
+  const { threads } = await api('/api/threads');
+  await decryptAll(threads.flatMap(t => [t.parent, ...t.latest]));
   if (state.view !== 'threads') return;
   const box = $('#msgs'); box.innerHTML = ''; codeStore.length = 0; hidePill();
   if (!threads.length) {
@@ -529,7 +678,7 @@ async function renderThreadsView() {
 // ---------- Panneau de fil ----------
 async function openThread(id, flashId) {
   let data;
-  try { data = await api(`/api/thread/${id}?${qs({ user: state.me })}`); }
+  try { data = await api(`/api/thread/${id}`); await decryptAll([data.parent, ...data.replies]); }
   catch (e) { return toast(e.message); }
   state.thread = { id, channel: data.parent.channel, parent: data.parent, replies: data.replies };
   state.threadUnread.delete(id);
@@ -674,7 +823,7 @@ document.addEventListener('mousedown', e => {
 
 // ---------- Réactions, édition, suppression ----------
 async function react(m, emoji) {
-  try { await api(`/api/messages/${m.id}/react`, { method: 'POST', body: JSON.stringify({ user: state.me, emoji }) }); }
+  try { await api(`/api/messages/${m.id}/react`, { method: 'POST', body: JSON.stringify({ emoji }) }); }
   catch (e) { toast(e.message); }
   if (emoji === '🎉') confetti();
 }
@@ -698,7 +847,10 @@ function startEdit(el) {
     if (!text.trim() && !m.file) return deleteMsg(m);
     try {
       // La mise à jour temps réel peut arriver avant la réponse : on rafraîchit nous-mêmes en sortant du mode édition
-      const updated = await api(`/api/messages/${m.id}`, { method: 'PATCH', body: JSON.stringify({ user: state.me, text }) });
+      const key = await keyFor(m.channel);
+      if (!key) return toast('Clé de chiffrement indisponible');
+      const enc = await E2E.encryptPayload(key, m.file?.e2e ? { text, file: fileMeta(m.file) } : { text }, m.channel);
+      const updated = await decryptMsg(await api(`/api/messages/${m.id}`, { method: 'PATCH', body: JSON.stringify({ enc }) }));
       el.classList.remove('editing');
       refreshMsg(updated);
     }
@@ -714,13 +866,13 @@ function startEdit(el) {
 async function deleteMsg(m) {
   const isRoot = !m.parent && m.thread;
   if (!confirm(isRoot ? `Supprimer ce message et les ${m.thread.count} réponse(s) de son fil ?` : 'Supprimer ce message ?')) return;
-  try { await api(`/api/messages/${m.id}?${qs({ user: state.me })}`, { method: 'DELETE' }); }
+  try { await api(`/api/messages/${m.id}`, { method: 'DELETE' }); }
   catch (err) { toast(err.message); }
 }
 
 // Actions sur les messages (délégation sur toute la page)
 document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-copy],[data-zoom],[data-act],[data-quick],.react[data-emoji]');
+  const t = e.target.closest('[data-copy],[data-zoom],[data-act],[data-quick],[data-download],.react[data-emoji]');
   if (!t || !t.closest('.msg')) return;
   if (t.dataset.copy !== undefined) return copy(codeStore[t.dataset.copy], t);
   if (t.dataset.zoom !== undefined) {
@@ -728,6 +880,7 @@ document.addEventListener('click', async e => {
     lb.innerHTML = `<img src="${t.src}">`; lb.onclick = () => lb.remove(); document.body.appendChild(lb); return;
   }
   const el = t.closest('.msg'), m = el._msg;
+  if (t.dataset.download !== undefined) { e.preventDefault(); return downloadFile(m); }
   if (t.dataset.quick) return react(m, t.dataset.quick);
   if (t.dataset.emoji) { t.classList.add('bump'); return react(m, t.dataset.emoji); }
   switch (t.dataset.act) {
@@ -842,7 +995,7 @@ function makeComposer(wrap, { target, lastOwn, scope, thread }) {
     if (ta.value.trim() && now - c.lastTypingPing > 2500) {
       c.lastTypingPing = now;
       const { channel, parent } = target();
-      fetch('/api/typing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: state.me, channel, parent }) }).catch(() => {});
+      api('/api/typing', { method: 'POST', body: JSON.stringify({ channel, parent }) }).catch(() => {});
     }
   });
   ta.addEventListener('click', updateAc);
@@ -876,11 +1029,16 @@ function makeComposer(wrap, { target, lastOwn, scope, thread }) {
     }
     const { channel, parent } = target();
     const broadcast = thread && $('input', bc).checked;
+    if (!isDm(channel)) await ensureChannelKey(channel).catch(() => {});
+    const key = await keyFor(channel);
+    if (!key) return toast(isDm(channel) ? 'Cette personne n\'a pas de compte : impossible de lui écrire.' : 'La clé de chiffrement du canal n\'est pas encore arrivée.');
+    const original = ta.value;
     ta.value = ''; autosize(); hideAc();
     try {
-      await api('/api/messages', { method: 'POST', body: JSON.stringify({ user: state.me, channel, text, parent, broadcast }) });
+      const enc = await E2E.encryptPayload(key, { text }, channel);
+      await api('/api/messages', { method: 'POST', body: JSON.stringify({ channel, enc, parent, broadcast }) });
       if (broadcast) $('input', bc).checked = false;
-    } catch (e) { ta.value = text; autosize(); toast(e.message); }
+    } catch (e) { ta.value = original; autosize(); toast(e.message); }
   }
   sendBtn.onclick = send;
 
@@ -897,24 +1055,37 @@ function makeComposer(wrap, { target, lastOwn, scope, thread }) {
     if (files.length) { e.preventDefault(); files.forEach(f => c.upload(f.name === 'image.png' ? new File([f], `capture-${Date.now()}.png`, { type: f.type }) : f)); }
   });
 
-  c.upload = file => {
+  // Envoi d'un fichier : chiffré dans le navigateur, envoyé, puis annoncé par un message chiffré qui porte
+  // son nom, son type et son IV.
+  c.upload = async file => {
     const { channel, parent } = target();
+    if (!isDm(channel)) await ensureChannelKey(channel).catch(() => {});
+    const key = await keyFor(channel);
+    if (!key) return toast('Clé de chiffrement indisponible pour cette conversation.');
     const row = document.createElement('div');
     row.className = 'up';
-    row.innerHTML = `${icon('upload')}<span class="uname">${esc(file.name)}</span><small>${fmtSize(file.size)}</small><span class="bar"><i></i></span>`;
+    row.innerHTML = `${icon('lock')}<span class="uname">${esc(file.name)}</span><small>Chiffrement…</small><span class="bar"><i></i></span>`;
     ups.appendChild(row);
+    let encrypted;
+    try { encrypted = await E2E.encryptFile(key, await file.arrayBuffer(), channel); }
+    catch { row.remove(); return toast('Impossible de chiffrer ce fichier (trop gros pour le navigateur ?)'); }
+    row.querySelector('small').textContent = fmtSize(file.size);
     const xhr = new XMLHttpRequest();
-    const params = { user: state.me, channel, name: file.name };
-    if (parent) params.parent = parent;
-    xhr.open('POST', '/api/upload?' + qs(params));
-    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.upload.onprogress = e => { if (e.lengthComputable) row.querySelector('.bar i').style.width = (e.loaded / e.total * 100) + '%'; };
-    xhr.onload = () => {
+    xhr.onload = async () => {
+      try {
+        if (xhr.status >= 300) { let msg = 'Échec de l\'envoi'; try { msg = JSON.parse(xhr.responseText).error; } catch {} throw new Error(msg); }
+        const { fileId } = JSON.parse(xhr.responseText);
+        const enc = await E2E.encryptPayload(key, { text: '', file: { name: file.name, type: file.type, size: file.size, iv: encrypted.iv } }, channel);
+        await api('/api/messages', { method: 'POST', body: JSON.stringify({ channel, parent, enc, fileId }) });
+      } catch (e) { toast(e.message); }
       row.remove();
-      if (xhr.status >= 300) { let msg = 'Échec de l\'envoi'; try { msg = JSON.parse(xhr.responseText).error; } catch {} toast(msg); }
     };
     xhr.onerror = () => { row.remove(); toast('Échec de l\'envoi de ' + file.name); };
-    xhr.send(file);
+    xhr.send(encrypted.data);
   };
   return c;
 }
@@ -952,13 +1123,23 @@ function replaceIn(list, m) {
 }
 function connect() {
   es?.close();
-  es = new EventSource(`/api/events?${qs({ user: state.me })}`);
+  es = new EventSource(`/api/events?${qs({ token: state.token })}`);
   es.onopen = () => $('#offline').hidden = true;
-  es.onerror = () => $('#offline').hidden = false;
-  es.addEventListener('hello', async e => {
-    const d = JSON.parse(e.data);
+  es.onerror = () => {
+    $('#offline').hidden = false;
+    // Flux fermé définitivement (ex. session expirée) : on vérifie la session puis on retente
+    if (es.readyState === EventSource.CLOSED) setTimeout(() => api('/api/users').then(connect).catch(() => setTimeout(connect, 3000)), 2000);
+  };
+  // Les événements sont traités dans l'ordre, l'un après l'autre (le déchiffrement est asynchrone)
+  let queue = Promise.resolve();
+  const on = (name, fn) => es.addEventListener(name, e => { queue = queue.then(() => fn(JSON.parse(e.data))).catch(err => console.error(err)); });
+  on('hello', async d => {
     state.channels = d.channels; state.online = d.online;
-    const { dms } = await api(`/api/dms?${qs({ user: state.me })}`);
+    await loadUsers();
+    await loadKeys();
+    scheduleShare();
+    searchCache = null;
+    const { dms } = await api('/api/dms');
     dms.forEach(ch => state.dms.add(ch));
     // Après une reconnexion on recharge tout pour récupérer ce qu'on a raté
     state.cache = {};
@@ -966,18 +1147,24 @@ function connect() {
     if (state.view === 'threads') openThreadsView(); else openChannel(state.current);
     if (state.thread) openThread(state.thread.id);
   });
-  es.addEventListener('presence', e => { state.online = JSON.parse(e.data).online; renderSidebar(); });
-  es.addEventListener('channels', e => { state.channels = JSON.parse(e.data).channels; renderSidebar(); });
-  es.addEventListener('typing', e => {
-    const { user, channel, parent } = JSON.parse(e.data);
+  on('presence', d => { state.online = d.online; renderSidebar(); });
+  on('channels', d => { state.channels = d.channels; renderSidebar(); });
+  on('user', u => { state.users.set(u.name, u.pub); state.known.add(u.name); renderSidebar(); scheduleShare(); });
+  on('keys', async ({ channel, holders }) => {
+    state.holders[channel] = holders;
+    if (holders.includes(state.me) && !state.chKeys.has(channel)) (await loadKeys()).forEach(onKeyArrived);
+    if (state.chKeys.has(channel)) scheduleShare();
+  });
+  on('typing', ({ user, channel, parent }) => {
     if (user === state.me) return;
     const key = `${channel}|${parent || 0}`;
     if (!state.typers.has(key)) state.typers.set(key, new Map());
     state.typers.get(key).set(user, Date.now() + 4000);
     renderTyping();
   });
-  es.addEventListener('message', e => {
-    const m = JSON.parse(e.data);
+  on('message', async m => {
+    await decryptMsg(m);
+    searchCache = null;
     const mine = m.user === state.me;
     state.known.add(m.user);
     state.typers.get(`${m.channel}|${m.parent || 0}`)?.delete(m.user);
@@ -1012,8 +1199,9 @@ function connect() {
     }
     renderSidebar();
   });
-  es.addEventListener('update', e => {
-    const m = JSON.parse(e.data);
+  on('update', async m => {
+    await decryptMsg(m);
+    searchCache = null;
     replaceIn(state.cache[m.channel]?.messages, m);
     if (state.thread) {
       if (state.thread.id === m.id) state.thread.parent = m;
@@ -1021,8 +1209,8 @@ function connect() {
     }
     refreshMsg(m);
   });
-  es.addEventListener('delete', e => {
-    const { id, channel, parent } = JSON.parse(e.data);
+  on('delete', ({ id, channel, parent }) => {
+    searchCache = null;
     const data = state.cache[channel];
     if (data) data.messages = data.messages.filter(m => m.id !== id);
     if (state.thread) {
@@ -1037,7 +1225,7 @@ function notify(m, inThread) {
   if (!(inThread || isDm(m.channel) || isMentioned(m) || document.hidden)) return;
   ping();
   const where = inThread ? `a répondu dans un fil · ${label(m.channel)}` : label(m.channel);
-  const body = m.text ? m.text.slice(0, 140) : '📎 ' + m.file.name;
+  const body = m.text ? m.text.slice(0, 140) : m.file ? '📎 ' + (m.file.name || 'fichier') : '🔒 Message chiffré';
   const open = () => { if (inThread) { openChannel(m.channel); openThread(m.parent, m.id); } else openChannel(m.channel); };
   if (!document.hidden && (inThread || isDm(m.channel) || isMentioned(m))) toast(`${m.user} ${inThread ? 'a répondu dans un fil' : '· ' + label(m.channel)} : ${body.slice(0, 60)}`, open);
   if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
@@ -1063,23 +1251,70 @@ $('#menu').onclick = () => $('#app').classList.toggle('open');
 $('#backdrop').onclick = () => $('#app').classList.remove('open');
 $('#wsHost').innerHTML = `${icon('bubble', 'width:12px;height:12px')}${esc(location.host)}`;
 $('#invite').onclick = () => copy(location.origin);
-$('#rename').onclick = () => { $('#loginName').value = state.me; updatePreview(); $('#loginModal').hidden = false; $('#loginName').focus(); };
 function updatePreview() {
   const v = $('#loginName').value.trim();
   $('#avPreview').textContent = v ? [...v][0].toUpperCase() : '?';
-  $('#avPreview').style.background = v ? colorOf(v.replace(/\s+/g, '_')) : '';
+  $('#avPreview').style.background = v ? colorOf(v) : '';
 }
 $('#loginName').addEventListener('input', updatePreview);
-$('#loginForm').onsubmit = e => {
+
+// ---------- Connexion / création de compte ----------
+let authMode = 'login';
+const authError = t => { $('#authError').textContent = t; $('#authError').hidden = !t; };
+function setAuthMode(mode) {
+  authMode = mode;
+  document.querySelectorAll('#authTabs button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  document.querySelectorAll('.reg-only').forEach(el => { el.hidden = mode !== 'register'; });
+  $('#loginPass2').required = $('#loginCode').required = mode === 'register';
+  $('#loginPass').autocomplete = mode === 'register' ? 'new-password' : 'current-password';
+  $('#authBtn').textContent = mode === 'register' ? 'Créer mon compte' : 'Se connecter';
+  authError('');
+}
+document.querySelectorAll('#authTabs button').forEach(b => { b.onclick = () => setAuthMode(b.dataset.mode); });
+async function postJson(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || 'Erreur ' + r.status);
+  return d;
+}
+$('#loginForm').onsubmit = async e => {
   e.preventDefault();
-  const name = $('#loginName').value.trim().replace(/\s+/g, '_').slice(0, 32);
-  if (!name) return;
-  state.me = name;
-  store.set('lanchat:user', name);
-  $('#loginModal').hidden = true;
-  start();
+  const name = $('#loginName').value.trim(), pw = $('#loginPass').value;
+  if (!/^[\w.\-À-ÿ]{2,32}$/.test(name)) return authError('Pseudo : 2 à 32 caractères (lettres, chiffres, . - _), sans espace.');
+  if (authMode === 'register') {
+    if (pw.length < 8) return authError('Le mot de passe doit faire au moins 8 caractères.');
+    if (pw !== $('#loginPass2').value) return authError('Les deux mots de passe ne correspondent pas.');
+  }
+  const btn = $('#authBtn'), label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = authMode === 'register' ? 'Génération de tes clés…' : 'Vérification…';
+  authError('');
+  try {
+    const pre = await fetch('/api/prelogin?' + qs({ name })).then(r => r.json());
+    let session;
+    if (authMode === 'register') {
+      if (pre.exists) throw new Error('Ce pseudo est déjà pris.');
+      const kdfSalt = E2E.randomB64(16);
+      const { authKey, encKey } = await E2E.deriveFromPassword(pw, kdfSalt);
+      const id = await E2E.createIdentity(encKey);
+      const r = await postJson('/api/register', { name, code: $('#loginCode').value, kdfSalt, authKey, pub: id.pub, encPriv: id.encPriv });
+      session = { name, token: r.token, priv: id.priv, pub: id.pub };
+    } else {
+      if (!pre.exists) throw new Error('Pseudo ou mot de passe incorrect');
+      const { authKey, encKey } = await E2E.deriveFromPassword(pw, pre.kdfSalt);
+      const r = await postJson('/api/login', { name, authKey });
+      session = { name, token: r.token, priv: await E2E.openIdentity(encKey, r.encPriv), pub: r.pub };
+    }
+    try { await E2E.saveSession(session); } catch {} // navigation privée : il faudra se reconnecter au rechargement
+    store.set('lanchat:account', name);
+    $('#loginPass').value = ''; $('#loginPass2').value = '';
+    $('#loginModal').hidden = true;
+    begin(session);
+  } catch (err) { authError(err.message || 'Échec de la connexion'); }
+  finally { btn.disabled = false; btn.textContent = label; }
 };
-function start() {
+function begin(s) {
+  Object.assign(state, { me: s.name, token: s.token, priv: s.priv, pub: s.pub });
   $('#meName').textContent = state.me;
   const av = $('#meAvatar');
   av.style.background = colorOf(state.me);
@@ -1089,6 +1324,17 @@ function start() {
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
   connect();
 }
+let loggingOut = false;
+async function logout(reason) {
+  if (loggingOut) return;
+  loggingOut = true;
+  es?.close();
+  try { await fetch('/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + state.token } }); } catch {}
+  await E2E.clearSession();
+  try { if (reason) sessionStorage.setItem('lanchat:flash', reason); } catch {}
+  location.reload();
+}
+$('#logoutBtn').onclick = () => { if (confirm('Se déconnecter de LAN Chat sur ce navigateur ?')) logout(); };
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
   if (state.view === 'channel') {
@@ -1100,4 +1346,22 @@ document.addEventListener('visibilitychange', () => {
   renderSidebar();
 });
 
-if (state.me) start(); else { $('#loginModal').hidden = false; $('#loginName').focus(); }
+(async () => {
+  // WebCrypto n'existe qu'en HTTPS (ou sur localhost) : sans lui, pas de chiffrement possible
+  if (!E2E.available()) {
+    $('#httpsLink').href = 'https://' + location.host + location.pathname;
+    $('#insecure').hidden = false;
+    return;
+  }
+  const s = await E2E.loadSession();
+  if (s && s.token && s.priv) return begin(s);
+  const account = store.get('lanchat:account'), oldPseudo = store.get('lanchat:user');
+  $('#loginName').value = account || oldPseudo || '';
+  updatePreview();
+  setAuthMode(account || !oldPseudo ? 'login' : 'register'); // ancien utilisateur sans compte : on lui propose d'en créer un
+  let flash = null;
+  try { flash = sessionStorage.getItem('lanchat:flash'); sessionStorage.removeItem('lanchat:flash'); } catch {}
+  if (flash) authError(flash);
+  $('#loginModal').hidden = false;
+  ($('#loginName').value ? $('#loginPass') : $('#loginName')).focus();
+})();

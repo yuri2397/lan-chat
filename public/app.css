@@ -373,3 +373,22 @@ kbd { font: 11px var(--mono); padding: 1px 6px; border-radius: 5px; border: 1px 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ===== Comptes & chiffrement ===== */
+.tabs { display: flex; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px; padding: 3px; margin-bottom: 14px; }
+.tabs button { flex: 1; border: 0; background: none; border-radius: 8px; padding: 7px; font-size: 13.5px; font-weight: 600; color: var(--muted); }
+.tabs button.on { background: var(--elev); color: var(--text); box-shadow: var(--shadow); }
+.field > .ic { margin-left: 12px; width: 16px; height: 16px; color: var(--faint); }
+.welcome .field { margin-bottom: 10px; }
+.welcome .btn.primary { margin-top: 6px; }
+.auth-error { background: rgba(229,72,77,.12); color: var(--danger); border-radius: 8px; padding: 8px 10px; font-size: 13px; margin-bottom: 10px; text-align: left; }
+.auth-note { font-size: 12.5px !important; text-align: left; background: var(--bg-soft); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px !important; }
+.keywait { display: flex; align-items: center; gap: 10px; margin: 0 20px 8px; padding: 10px 12px; border-radius: 10px; background: var(--mention); border: 1px solid var(--mention-bar); font-size: 13px; color: var(--text); }
+.keywait .ic { color: var(--mention-bar); }
+.locked { color: var(--muted); font-style: italic; display: flex; align-items: center; gap: 6px; }
+.locked .ic { width: 14px; height: 14px; }
+.legacy { font-size: 10.5px; color: var(--faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.intro .safety { display: flex; gap: 8px; margin-top: 10px; font-size: 13px; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.intro .safety .ic { width: 16px; height: 16px; color: var(--online); margin-top: 2px; }
+.intro .safety code { font: 600 13px var(--mono); color: var(--text); letter-spacing: .04em; }
+@media (max-width: 760px) { .keywait { margin: 0 10px 8px; } }

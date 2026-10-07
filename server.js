@@ -1,32 +1,111 @@
 #!/usr/bin/env node
 // LAN Chat — petit chat façon Slack pour le réseau local. Zéro dépendance.
-// Lancer : node server.js   (PORT=3000 par défaut)
+//
+//   node server.js                    démarre le chat (PORT=3000 par défaut, HTTPS auto-signé)
+//   LANCHAT_HTTP=1 node server.js     HTTP simple, derrière un proxy HTTPS (Dokploy/Traefik, voir Dockerfile)
+//   node server.js reset-user <nom>   supprime un compte (mot de passe oublié) pour qu'il puisse être recréé
+//
+// Sécurité :
+// - Comptes protégés par mot de passe. Le mot de passe ne quitte jamais le navigateur : le client en dérive
+//   (PBKDF2) une clé d'authentification, seule envoyée au serveur, et une clé de chiffrement qui reste locale.
+// - Chiffrement de bout en bout : textes et fichiers arrivent ici déjà chiffrés (AES-GCM). Le serveur stocke
+//   et relaie des données qu'il ne peut pas lire. Restent en clair : pseudos, canaux, horaires, réactions.
+// - HTTPS obligatoire (WebCrypto n'existe dans le navigateur qu'en contexte sécurisé).
 
 const http = require('http');
+const https = require('https');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const TLS_DIR = path.join(DATA_DIR, 'tls');
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const MAX_UPLOAD = 500 * 1024 * 1024; // 500 Mo
-const MAX_JSON = 1024 * 1024; // 1 Mo
+const MAX_JSON = 2 * 1024 * 1024; // 2 Mo (un message chiffré est ~1,4× plus gros que le texte)
 const PAGE_SIZE = 100;
+const NAME_RE = /^[\w.\-À-ÿ]{2,32}$/;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// ---------- État en mémoire ----------
-let channels = ['general', 'code', 'liens'];
-if (fs.existsSync(CHANNELS_FILE)) {
-  try { channels = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8')); } catch {}
+const readJsonFile = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
+function writeJsonFile(file, value, secret = false) {
+  fs.writeFileSync(file + '.tmp', JSON.stringify(value), secret ? { mode: 0o600 } : undefined);
+  fs.renameSync(file + '.tmp', file);
 }
-const saveChannels = () => fs.writeFileSync(CHANNELS_FILE, JSON.stringify(channels));
+const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
+const lanIps = () => Object.values(os.networkInterfaces()).flat()
+  .filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
 
-// Message : { id, channel, user, text, file?, ts, parent?, broadcast?, edited?, reactions? }
+// ---------- Comptes, sessions, clés de canal ----------
+const users = readJsonFile(USERS_FILE, {});       // nom -> { authSalt, authHash, kdfSalt, pub, encPriv, created }
+const sessions = readJsonFile(SESSIONS_FILE, {}); // sha256(jeton) -> { user, created }
+const chanKeys = readJsonFile(KEYS_FILE, {});     // canal -> { destinataire -> { from, fromPub, wrapped } }
+const saveUsers = () => writeJsonFile(USERS_FILE, users, true);
+const saveSessions = () => writeJsonFile(SESSIONS_FILE, sessions, true);
+const saveKeys = () => writeJsonFile(KEYS_FILE, chanKeys, true);
+
+// Commande d'administration : node server.js reset-user <nom>
+if (process.argv[2] === 'reset-user') {
+  const name = process.argv[3];
+  if (!users[name]) { console.error(`Compte « ${name} » introuvable.`); process.exit(1); }
+  delete users[name];
+  for (const [h, s] of Object.entries(sessions)) if (s.user === name) delete sessions[h];
+  for (const ch of Object.keys(chanKeys)) delete chanKeys[ch][name];
+  saveUsers(); saveSessions(); saveKeys();
+  console.log(`Compte « ${name} » supprimé. Il peut être recréé ; ses anciens messages privés resteront illisibles pour lui.`);
+  process.exit(0);
+}
+
+const config = readJsonFile(CONFIG_FILE, {});
+if (!config.accessCode) {
+  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+  const part = () => Array.from(crypto.randomBytes(4), b => alphabet[b % alphabet.length]).join('');
+  config.accessCode = `${part()}-${part()}`;
+  writeJsonFile(CONFIG_FILE, config, true);
+}
+const ACCESS_CODE = process.env.LANCHAT_CODE || config.accessCode;
+
+function hashAuthKey(authKey, salt) {
+  return crypto.scryptSync(Buffer.from(String(authKey), 'base64'), Buffer.from(salt, 'base64'), 32).toString('base64');
+}
+function newSession(user) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  sessions[sha256(token)] = { user, created: Date.now() };
+  saveSessions();
+  return token;
+}
+const sessionUser = token => (token && sessions[sha256(token)]?.user) || null;
+
+// Anti force brute : 5 échecs -> blocage progressif
+const failures = new Map(); // nom -> { count, until }
+function checkThrottle(name) {
+  const f = failures.get(name);
+  return f && f.until > Date.now() ? Math.ceil((f.until - Date.now()) / 1000) : 0;
+}
+function recordFailure(name) {
+  const f = failures.get(name) || { count: 0, until: 0 };
+  f.count++;
+  if (f.count >= 5) f.until = Date.now() + Math.min(300, 15 * 2 ** (f.count - 5)) * 1000;
+  failures.set(name, f);
+}
+
+// ---------- Messages ----------
+let channels = readJsonFile(CHANNELS_FILE, ['general', 'code', 'liens']);
+const saveChannels = () => writeJsonFile(CHANNELS_FILE, channels);
+
+// Message : { id, channel, user, enc: { iv, ct }, file?: { id, size }, ts, parent?, broadcast?, edited?, reactions? }
+// (les anciens messages d'avant le chiffrement ont un champ `text` en clair)
 // Le journal (JSONL) contient des messages et des opérations { op: 'delete' | 'edit' | 'react', ... }.
 const messages = [];
 const byId = new Map();
@@ -51,16 +130,20 @@ function removeFromIndex(m) {
 }
 function toggleReaction(m, emoji, user) {
   m.reactions = m.reactions || {};
-  const users = m.reactions[emoji] || [];
-  m.reactions[emoji] = users.includes(user) ? users.filter(u => u !== user) : [...users, user];
+  const list = m.reactions[emoji] || [];
+  m.reactions[emoji] = list.includes(user) ? list.filter(u => u !== user) : [...list, user];
   if (!m.reactions[emoji].length) delete m.reactions[emoji];
   if (!Object.keys(m.reactions).length) delete m.reactions;
+}
+function applyEdit(m, o) {
+  if (o.enc) { m.enc = o.enc; delete m.text; } else m.text = o.text;
+  m.edited = o.ts;
 }
 function applyOp(o) {
   const m = byId.get(o.id);
   if (!m) return;
   if (o.op === 'delete') removeFromIndex(m);
-  else if (o.op === 'edit') { m.text = o.text; m.edited = o.ts; }
+  else if (o.op === 'edit') applyEdit(m, o);
   else if (o.op === 'react') toggleReaction(m, o.emoji, o.user);
 }
 if (fs.existsSync(MESSAGES_FILE)) {
@@ -75,12 +158,23 @@ if (fs.existsSync(MESSAGES_FILE)) {
 let nextId = messages.reduce((max, m) => Math.max(max, m.id), 0) + 1;
 const appendLog = obj => fs.appendFileSync(MESSAGES_FILE, JSON.stringify(obj) + '\n');
 
+// Fichiers envoyés mais pas encore rattachés à un message : id -> { user, size, ts }
+const pendingFiles = new Map();
+// Ménage au démarrage : fichiers orphelins (envoi interrompu) de plus d'une heure
+{
+  const used = new Set(messages.filter(m => m.file).map(m => m.file.id));
+  for (const f of fs.readdirSync(UPLOAD_DIR)) {
+    const p = path.join(UPLOAD_DIR, f);
+    if (!used.has(f) && Date.now() - fs.statSync(p).mtimeMs > 3600e3) fs.rmSync(p, { force: true });
+  }
+}
+
 // Ajoute le résumé du fil (nombre de réponses, participants, dernière réponse) à un message.
 function out(m) {
   const r = replies.get(m.id);
   if (!r || !r.length) return m;
-  const users = [...new Set(r.map(x => x.user))];
-  return { ...m, thread: { count: r.length, users: users.slice(-5), lastTs: r[r.length - 1].ts } };
+  const names = [...new Set(r.map(x => x.user))];
+  return { ...m, thread: { count: r.length, users: names.slice(-5), lastTs: r[r.length - 1].ts } };
 }
 const participants = parentId => {
   const p = byId.get(parentId);
@@ -91,11 +185,12 @@ const participants = parentId => {
 const clients = new Set();
 const onlineUsers = () => [...new Set([...clients].map(c => c.user))].sort((a, b) => a.localeCompare(b));
 
-// Un DM s'appelle "@alice|bob" (noms triés). Pas d'authentification : réseau de confiance.
+// Un DM s'appelle "@alice|bob" (noms triés).
 const isDm = ch => ch.startsWith('@');
 const dmMembers = ch => ch.slice(1).split('|');
 const canSee = (user, ch) => !isDm(ch) || dmMembers(ch).includes(user);
-const validChannel = ch => channels.includes(ch) || (isDm(ch) && dmMembers(ch).length === 2);
+const validChannel = ch => channels.includes(ch) || (isDm(ch) && dmMembers(ch).length === 2 && dmMembers(ch).every(n => users[n]));
+const keyHolders = ch => Object.keys(chanKeys[ch] || {});
 
 function send(client, event, data) {
   client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -114,7 +209,7 @@ function publish(msg) {
 
 // ---------- Helpers HTTP ----------
 function json(res, status, data) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(data));
 }
 function readJson(req) {
@@ -133,8 +228,8 @@ function readJson(req) {
     req.on('error', reject);
   });
 }
-const cleanName = s => String(s || '').trim().slice(0, 32);
-const safeFileName = s => String(s || 'fichier').replace(/[\/\\?%*:|"<>\x00-\x1f]/g, '_').slice(0, 150) || 'fichier';
+const isB64 = (s, max) => typeof s === 'string' && s.length > 0 && s.length <= max && /^[A-Za-z0-9+/=]+$/.test(s);
+const validEnc = e => e && isB64(e.iv, 32) && isB64(e.ct, MAX_JSON);
 // Valide le parent d'une réponse : il doit exister, être un message racine et appartenir au même canal.
 function validParent(parentId, channel) {
   if (!parentId) return true;
@@ -148,60 +243,162 @@ const MIME = {
   '.svg': 'image/svg+xml', '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json',
   '.mp4': 'video/mp4', '.webm': 'video/webm', '.mp3': 'audio/mpeg', '.zip': 'application/zip', '.ico': 'image/x-icon',
 };
-// Types affichables dans le navigateur sans risque (le SVG/HTML est forcé en téléchargement).
+// Anciens fichiers en clair affichables dans le navigateur sans risque (le SVG/HTML est forcé en téléchargement).
 const INLINE_OK = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.mp4', '.webm', '.mp3', '.txt']);
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+};
 
 // ---------- Routes ----------
 async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
+  const token = (req.headers.authorization || '').replace(/^Bearer /, '') || url.searchParams.get('token');
+  const me = sessionUser(token);
+
+  // Sonde de santé (Docker / Dokploy)
+  if (p === '/api/health') return json(res, 200, { ok: true });
+
+  // ----- Routes publiques : authentification -----
+  if (p === '/api/prelogin' && req.method === 'GET') {
+    const u = users[url.searchParams.get('name') || ''];
+    return json(res, 200, { exists: !!u, kdfSalt: u ? u.kdfSalt : null });
+  }
+
+  if (p === '/api/register' && req.method === 'POST') {
+    const body = await readJson(req);
+    const name = String(body.name || '').trim();
+    if (!NAME_RE.test(name)) return json(res, 400, { error: 'Pseudo invalide (2 à 32 lettres, chiffres, . - _)' });
+    if (String(body.code || '').trim().toLowerCase() !== ACCESS_CODE.toLowerCase()) {
+      recordFailure('register');
+      return json(res, 403, { error: 'Code d\'accès incorrect — demande-le à la personne qui héberge le chat' });
+    }
+    if (users[name]) return json(res, 409, { error: 'Ce pseudo est déjà pris' });
+    if (!isB64(body.authKey, 64) || !isB64(body.kdfSalt, 64) || !isB64(body.pub, 200) || !validEnc(body.encPriv)) {
+      return json(res, 400, { error: 'Données de compte invalides' });
+    }
+    const authSalt = crypto.randomBytes(16).toString('base64');
+    users[name] = { authSalt, authHash: hashAuthKey(body.authKey, authSalt), kdfSalt: body.kdfSalt, pub: body.pub, encPriv: body.encPriv, created: Date.now() };
+    saveUsers();
+    broadcast('user', { name, pub: body.pub });
+    return json(res, 201, { token: newSession(name), name });
+  }
+
+  if (p === '/api/login' && req.method === 'POST') {
+    const body = await readJson(req);
+    const name = String(body.name || '').trim();
+    const wait = checkThrottle(name);
+    if (wait) return json(res, 429, { error: `Trop de tentatives, réessaie dans ${wait} s` });
+    const u = users[name];
+    const ok = u && isB64(body.authKey, 64) &&
+      crypto.timingSafeEqual(Buffer.from(hashAuthKey(body.authKey, u.authSalt)), Buffer.from(u.authHash));
+    if (!ok) { recordFailure(name); return json(res, 401, { error: 'Pseudo ou mot de passe incorrect' }); }
+    failures.delete(name);
+    return json(res, 200, { token: newSession(name), name, pub: u.pub, encPriv: u.encPriv });
+  }
+
+  // ----- Fichiers statiques (l'application elle-même) -----
+  if (req.method === 'GET' && !p.startsWith('/api/') && !p.startsWith('/files/')) {
+    const rel = p === '/' ? 'index.html' : p.slice(1);
+    const file = path.join(__dirname, 'public', path.normalize(rel).replace(/^(\.\.[\/\\])+/, ''));
+    if (file.startsWith(path.join(__dirname, 'public')) && fs.existsSync(file) && fs.statSync(file).isFile()) {
+      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache', ...SECURITY_HEADERS });
+      return fs.createReadStream(file).pipe(res);
+    }
+    return json(res, 404, { error: 'Introuvable' });
+  }
+
+  // ----- Tout le reste exige une session -----
+  if (!me || !users[me]) return json(res, 401, { error: 'Session expirée, reconnecte-toi' });
+
+  if (p === '/api/logout' && req.method === 'POST') {
+    delete sessions[sha256(token)];
+    saveSessions();
+    return json(res, 200, { ok: true });
+  }
 
   // Flux temps réel (Server-Sent Events)
   if (p === '/api/events' && req.method === 'GET') {
-    const user = cleanName(url.searchParams.get('user'));
-    if (!user) return json(res, 400, { error: 'Pseudo requis' });
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    // X-Accel-Buffering : empêche un éventuel proxy de retenir le flux temps réel
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.write('retry: 2000\n\n');
-    const client = { res, user };
-    const wasOnline = onlineUsers().includes(user);
+    const client = { res, user: me };
+    const wasOnline = onlineUsers().includes(me);
     clients.add(client);
-    send(client, 'hello', { channels, online: onlineUsers() });
+    send(client, 'hello', { channels, online: onlineUsers(), me });
     if (!wasOnline) broadcast('presence', { online: onlineUsers() });
     const ping = setInterval(() => res.write(': ping\n\n'), 25000);
     req.on('close', () => {
       clearInterval(ping);
       clients.delete(client);
-      if (!onlineUsers().includes(user)) broadcast('presence', { online: onlineUsers() });
+      if (!onlineUsers().includes(me)) broadcast('presence', { online: onlineUsers() });
     });
     return;
+  }
+
+  // Annuaire des clés publiques
+  if (p === '/api/users' && req.method === 'GET') {
+    return json(res, 200, { users: Object.entries(users).map(([name, u]) => ({ name, pub: u.pub })) });
+  }
+
+  // Clés de canal : chaque membre reçoit la clé du canal chiffrée pour lui (ECDH avec la clé publique de l'expéditeur)
+  if (p === '/api/keys' && req.method === 'GET') {
+    const mine = {}, holders = {};
+    for (const ch of channels) {
+      holders[ch] = keyHolders(ch);
+      if (chanKeys[ch]?.[me]) mine[ch] = chanKeys[ch][me];
+    }
+    return json(res, 200, { mine, holders });
+  }
+  if (p === '/api/keys' && req.method === 'POST') {
+    const body = await readJson(req);
+    const ch = String(body.channel || '');
+    if (!channels.includes(ch)) return json(res, 400, { error: 'Canal inconnu' });
+    const existing = keyHolders(ch);
+    // Seul un détenteur de la clé peut la partager ; le premier à créer la clé doit se l'inclure.
+    if (existing.length && !existing.includes(me)) return json(res, 409, { error: 'La clé de ce canal existe déjà', holders: existing });
+    if (!existing.length && !(body.keys || {})[me]) return json(res, 400, { error: 'La clé doit inclure son créateur' });
+    chanKeys[ch] = chanKeys[ch] || {};
+    for (const [to, wrapped] of Object.entries(body.keys || {})) {
+      if (!users[to] || chanKeys[ch][to] || !validEnc(wrapped)) continue; // jamais d'écrasement
+      chanKeys[ch][to] = { from: me, fromPub: users[me].pub, wrapped };
+    }
+    saveKeys();
+    broadcast('keys', { channel: ch, holders: keyHolders(ch) });
+    return json(res, 200, { holders: keyHolders(ch) });
   }
 
   // Historique d'un canal (messages racines + réponses « aussi envoyées dans le canal »), paginé avec ?before=id
   if (p === '/api/messages' && req.method === 'GET') {
     const channel = url.searchParams.get('channel') || '';
-    const user = cleanName(url.searchParams.get('user'));
-    if (!canSee(user, channel)) return json(res, 403, { error: 'Accès refusé' });
+    if (!canSee(me, channel)) return json(res, 403, { error: 'Accès refusé' });
     const before = Number(url.searchParams.get('before')) || Infinity;
     const list = messages.filter(m => m.channel === channel && m.id < before && (!m.parent || m.broadcast));
     return json(res, 200, { messages: list.slice(-PAGE_SIZE).map(out), hasMore: list.length > PAGE_SIZE });
   }
 
+  // Tous les messages visibles (récents) : la recherche se fait dans le navigateur, après déchiffrement
+  if (p === '/api/all' && req.method === 'GET') {
+    return json(res, 200, { messages: messages.filter(m => canSee(me, m.channel)).slice(-3000).map(out) });
+  }
+
   // Fil de discussion : parent + réponses
   const th = p.match(/^\/api\/thread\/(\d+)$/);
   if (th && req.method === 'GET') {
-    const user = cleanName(url.searchParams.get('user'));
     const parent = byId.get(Number(th[1]));
-    if (!parent || !canSee(user, parent.channel)) return json(res, 404, { error: 'Fil introuvable' });
+    if (!parent || !canSee(me, parent.channel)) return json(res, 404, { error: 'Fil introuvable' });
     return json(res, 200, { parent: out(parent), replies: replies.get(parent.id) || [] });
   }
 
   // Fils auxquels l'utilisateur participe, du plus récent au plus ancien
   if (p === '/api/threads' && req.method === 'GET') {
-    const user = cleanName(url.searchParams.get('user'));
     const list = [];
     for (const [pid, r] of replies) {
       const parent = byId.get(pid);
-      if (!parent || !canSee(user, parent.channel) || !participants(pid).includes(user)) continue;
+      if (!parent || !canSee(me, parent.channel) || !participants(pid).includes(me)) continue;
       list.push({ parent: out(parent), latest: r.slice(-3) });
     }
     list.sort((a, b) => b.parent.thread.lastTs - a.parent.thread.lastTs);
@@ -210,31 +407,24 @@ async function handle(req, res) {
 
   // Liste des DM de l'utilisateur
   if (p === '/api/dms' && req.method === 'GET') {
-    const user = cleanName(url.searchParams.get('user'));
-    const dms = [...new Set(messages.filter(m => isDm(m.channel) && canSee(user, m.channel)).map(m => m.channel))];
+    const dms = [...new Set(messages.filter(m => isDm(m.channel) && canSee(me, m.channel)).map(m => m.channel))];
     return json(res, 200, { dms });
   }
 
-  // Recherche plein texte
-  if (p === '/api/search' && req.method === 'GET') {
-    const q = (url.searchParams.get('q') || '').toLowerCase().trim();
-    const user = cleanName(url.searchParams.get('user'));
-    if (!q) return json(res, 200, { messages: [] });
-    const found = messages.filter(m => canSee(user, m.channel) &&
-      ((m.text || '').toLowerCase().includes(q) || (m.file && m.file.name.toLowerCase().includes(q))));
-    return json(res, 200, { messages: found.slice(-50).reverse().map(out) });
-  }
-
-  // Nouveau message texte (ou réponse dans un fil avec `parent`)
+  // Nouveau message chiffré (ou réponse dans un fil avec `parent`, ou fichier avec `fileId`)
   if (p === '/api/messages' && req.method === 'POST') {
     const body = await readJson(req);
-    const user = cleanName(body.user);
-    const text = String(body.text || '').slice(0, 100000);
     const channel = String(body.channel || '');
-    if (!user || !text.trim()) return json(res, 400, { error: 'Pseudo et texte requis' });
-    if (!validChannel(channel) || !canSee(user, channel)) return json(res, 400, { error: 'Canal inconnu' });
+    if (!validEnc(body.enc)) return json(res, 400, { error: 'Message non chiffré refusé' });
+    if (!validChannel(channel) || !canSee(me, channel)) return json(res, 400, { error: 'Canal inconnu' });
     if (!validParent(body.parent, channel)) return json(res, 400, { error: 'Fil introuvable' });
-    const msg = { id: nextId++, channel, user, text, ts: Date.now() };
+    const msg = { id: nextId++, channel, user: me, enc: { iv: body.enc.iv, ct: body.enc.ct }, ts: Date.now() };
+    if (body.fileId) {
+      const f = pendingFiles.get(body.fileId);
+      if (!f || f.user !== me) return json(res, 400, { error: 'Fichier introuvable' });
+      pendingFiles.delete(body.fileId);
+      msg.file = { id: body.fileId, size: f.size };
+    }
     if (body.parent) { msg.parent = Number(body.parent); if (body.broadcast) msg.broadcast = true; }
     publish(msg);
     return json(res, 201, msg);
@@ -244,32 +434,31 @@ async function handle(req, res) {
   const one = p.match(/^\/api\/messages\/(\d+)(\/react)?$/);
   if (one) {
     const msg = byId.get(Number(one[1]));
-    if (!msg) return json(res, 404, { error: 'Message introuvable' });
+    if (!msg || !canSee(me, msg.channel)) return json(res, 404, { error: 'Message introuvable' });
 
     if (one[2] && req.method === 'POST') {
       const body = await readJson(req);
-      const user = cleanName(body.user);
       const emoji = String(body.emoji || '').slice(0, 16);
-      if (!user || !emoji || !canSee(user, msg.channel)) return json(res, 400, { error: 'Réaction invalide' });
-      toggleReaction(msg, emoji, user);
-      appendLog({ op: 'react', id: msg.id, emoji, user });
+      if (!emoji) return json(res, 400, { error: 'Réaction invalide' });
+      toggleReaction(msg, emoji, me);
+      appendLog({ op: 'react', id: msg.id, emoji, user: me });
       broadcast('update', out(msg), msg.channel);
       return json(res, 200, out(msg));
     }
 
     if (!one[2] && req.method === 'PATCH') {
       const body = await readJson(req);
-      const text = String(body.text || '').slice(0, 100000);
-      if (msg.user !== cleanName(body.user)) return json(res, 403, { error: 'Ce n\'est pas ton message' });
-      if (!text.trim() && !msg.file) return json(res, 400, { error: 'Le message est vide' });
-      msg.text = text; msg.edited = Date.now();
-      appendLog({ op: 'edit', id: msg.id, text, ts: msg.edited });
+      if (msg.user !== me) return json(res, 403, { error: 'Ce n\'est pas ton message' });
+      if (!validEnc(body.enc)) return json(res, 400, { error: 'Message non chiffré refusé' });
+      const op = { op: 'edit', id: msg.id, enc: { iv: body.enc.iv, ct: body.enc.ct }, ts: Date.now() };
+      applyEdit(msg, op);
+      appendLog(op);
       broadcast('update', out(msg), msg.channel);
       return json(res, 200, out(msg));
     }
 
     if (!one[2] && req.method === 'DELETE') {
-      if (msg.user !== cleanName(url.searchParams.get('user'))) return json(res, 403, { error: 'Ce n\'est pas ton message' });
+      if (msg.user !== me) return json(res, 403, { error: 'Ce n\'est pas ton message' });
       // Supprimer un message racine supprime aussi son fil
       for (const m of [...(replies.get(msg.id) || []), msg]) {
         removeFromIndex(m);
@@ -285,10 +474,9 @@ async function handle(req, res) {
   // Indicateur « est en train d'écrire »
   if (p === '/api/typing' && req.method === 'POST') {
     const body = await readJson(req);
-    const user = cleanName(body.user);
     const channel = String(body.channel || '');
-    if (user && validChannel(channel) && canSee(user, channel)) {
-      broadcast('typing', { user, channel, parent: Number(body.parent) || null }, channel);
+    if (validChannel(channel) && canSee(me, channel)) {
+      broadcast('typing', { user: me, channel, parent: Number(body.parent) || null }, channel);
     }
     res.writeHead(204); return res.end();
   }
@@ -306,17 +494,10 @@ async function handle(req, res) {
     return json(res, 201, { name });
   }
 
-  // Upload de fichier (corps brut, métadonnées en query string)
+  // Envoi d'un fichier chiffré (corps brut). Il est rattaché ensuite à un message via `fileId`.
   if (p === '/api/upload' && req.method === 'POST') {
-    const user = cleanName(url.searchParams.get('user'));
-    const channel = url.searchParams.get('channel') || '';
-    const parent = Number(url.searchParams.get('parent')) || null;
-    const name = safeFileName(url.searchParams.get('name'));
-    const text = String(url.searchParams.get('text') || '').slice(0, 2000);
-    if (!user || !validChannel(channel) || !canSee(user, channel) || !validParent(parent, channel)) return json(res, 400, { error: 'Requête invalide' });
     const declared = Number(req.headers['content-length'] || 0);
     if (declared > MAX_UPLOAD) return json(res, 413, { error: 'Fichier trop gros (500 Mo max)' });
-
     const id = crypto.randomBytes(12).toString('hex');
     const dest = path.join(UPLOAD_DIR, id);
     const outStream = fs.createWriteStream(dest);
@@ -332,59 +513,97 @@ async function handle(req, res) {
     req.pipe(outStream);
     outStream.on('finish', () => {
       if (aborted) return;
-      const file = { id, name, size, type: req.headers['content-type'] || 'application/octet-stream' };
-      const msg = { id: nextId++, channel, user, text, file, ts: Date.now() };
-      if (parent) msg.parent = parent;
-      publish(msg);
-      json(res, 201, msg);
+      pendingFiles.set(id, { user: me, size, ts: Date.now() });
+      json(res, 201, { fileId: id, size });
     });
     outStream.on('error', () => { if (!aborted) json(res, 500, { error: 'Écriture impossible' }); });
     return;
   }
 
-  // Téléchargement : /files/<id>/<nom>
-  const f = p.match(/^\/files\/([a-f0-9]{24})\/(.+)$/);
+  // Téléchargement : /files/<id>[/<nom>] — contrôle d'accès selon le canal du message
+  const f = p.match(/^\/files\/([a-f0-9]{24})(?:\/(.+))?$/);
   if (f && req.method === 'GET') {
     const file = path.join(UPLOAD_DIR, f[1]);
-    if (!fs.existsSync(file)) { res.writeHead(404); return res.end('Fichier introuvable'); }
-    const name = decodeURIComponent(f[2]);
+    const owner = messages.find(m => m.file && m.file.id === f[1]);
+    if (!owner || !canSee(me, owner.channel) || !fs.existsSync(file)) { res.writeHead(404); return res.end('Fichier introuvable'); }
+    const name = owner.enc ? 'fichier-chiffre.bin' : decodeURIComponent(f[2] || owner.file.name || 'fichier');
     const ext = path.extname(name).toLowerCase();
-    const inline = INLINE_OK.has(ext) && url.searchParams.get('dl') !== '1';
+    const inline = !owner.enc && INLINE_OK.has(ext) && url.searchParams.get('dl') !== '1';
     res.writeHead(200, {
       'Content-Type': inline ? (MIME[ext] || 'application/octet-stream') : 'application/octet-stream',
       'Content-Length': fs.statSync(file).size,
       'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(name)}`,
-      'X-Content-Type-Options': 'nosniff',
       'Cache-Control': 'private, max-age=31536000, immutable',
+      ...SECURITY_HEADERS,
     });
     return fs.createReadStream(file).pipe(res);
-  }
-
-  // Fichiers statiques
-  if (req.method === 'GET') {
-    const rel = p === '/' ? 'index.html' : p.slice(1);
-    const file = path.join(__dirname, 'public', path.normalize(rel).replace(/^(\.\.[\/\\])+/, ''));
-    if (file.startsWith(path.join(__dirname, 'public')) && fs.existsSync(file) && fs.statSync(file).isFile()) {
-      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
-      return fs.createReadStream(file).pipe(res);
-    }
   }
 
   json(res, 404, { error: 'Introuvable' });
 }
 
-const server = http.createServer((req, res) => {
+function handler(req, res) {
   handle(req, res).catch(err => {
     if (!res.headersSent) json(res, 400, { error: err.message || 'Erreur' });
   });
-});
-server.requestTimeout = 0; // gros uploads sur réseau lent
+}
+
+// ---------- HTTPS (certificat auto-signé généré au premier lancement) ----------
+function loadTls() {
+  if (process.env.LANCHAT_HTTP === '1') return null;
+  const keyFile = path.join(TLS_DIR, 'key.pem'), certFile = path.join(TLS_DIR, 'cert.pem');
+  if (!fs.existsSync(keyFile) || !fs.existsSync(certFile)) {
+    fs.mkdirSync(TLS_DIR, { recursive: true });
+    const san = ['DNS:localhost', 'IP:127.0.0.1', ...lanIps().map(ip => 'IP:' + ip)].join(',');
+    const base = ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', keyFile, '-out', certFile, '-days', '3650', '-subj', '/CN=LAN Chat'];
+    try { execFileSync('openssl', [...base, '-addext', 'subjectAltName=' + san], { stdio: 'ignore' }); }
+    catch {
+      try { execFileSync('openssl', base, { stdio: 'ignore' }); }
+      catch { return null; }
+    }
+    fs.chmodSync(keyFile, 0o600);
+  }
+  return { key: fs.readFileSync(keyFile), cert: fs.readFileSync(certFile) };
+}
+
+const tls = loadTls();
+let server;
+if (tls) {
+  const secure = https.createServer(tls, handler);
+  secure.requestTimeout = 0; // gros uploads sur réseau lent
+  // Quelqu'un qui tape http:// sur le même port est redirigé vers https://
+  const redirect = http.createServer((req, res) => {
+    res.writeHead(301, { Location: `https://${req.headers.host || 'localhost:' + PORT}${req.url}` });
+    res.end();
+  });
+  server = net.createServer(socket => {
+    socket.on('error', () => {});
+    socket.once('data', buf => {
+      socket.pause();
+      socket.unshift(buf);
+      (buf[0] === 0x16 ? secure : redirect).emit('connection', socket); // 0x16 = début d'une poignée de main TLS
+      process.nextTick(() => socket.resume());
+    });
+  });
+} else {
+  server = http.createServer(handler);
+  server.requestTimeout = 0;
+}
 
 server.listen(PORT, '0.0.0.0', () => {
-  const ips = Object.values(os.networkInterfaces()).flat()
-    .filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
+  const scheme = tls ? 'https' : 'http';
   console.log('\n  💬 LAN Chat démarré\n');
-  console.log(`  Sur cette machine : http://localhost:${PORT}`);
-  for (const ip of ips) console.log(`  Pour les collègues : http://${ip}:${PORT}`);
+  console.log(`  Sur cette machine  : ${scheme}://localhost:${PORT}`);
+  for (const ip of lanIps()) console.log(`  Pour les collègues : ${scheme}://${ip}:${PORT}`);
+  console.log(`\n  🔑 Code d'accès pour créer un compte : ${ACCESS_CODE}`);
+  if (tls) {
+    console.log('\n  Certificat auto-signé : au premier accès, le navigateur affiche un avertissement.');
+    console.log('  Clique sur « Paramètres avancés » puis « Continuer vers le site ».');
+  } else if (process.env.LANCHAT_HTTP === '1') {
+    console.log('\n  Mode HTTP : à placer derrière un proxy HTTPS (Dokploy/Traefik). Le chiffrement exige HTTPS côté navigateur.');
+  } else {
+    console.log('\n  ⚠️  HTTPS indisponible (openssl introuvable) : le chiffrement de bout en bout ne fonctionnera');
+    console.log('     que sur http://localhost. Installe openssl, ou place cert.pem et key.pem dans data/tls/.');
+  }
   console.log(`\n  Données : ${DATA_DIR}\n`);
 });

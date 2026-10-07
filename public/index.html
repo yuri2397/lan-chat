@@ -30,7 +30,9 @@
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
     <symbol id="i-auto" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></symbol>
     <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></symbol>
-    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8M17 6l3 3M14.5 8.5l2 2"/></symbol>
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></symbol>
     <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 21V9M7 14l5-5 5 5M5 3h14"/></symbol>
@@ -67,7 +69,7 @@
       <div class="me-info"><div class="me-name" id="meName"></div><div class="me-status">En ligne</div></div>
       <button class="icon-btn" id="soundBtn" title="Sons"></button>
       <button class="icon-btn" id="themeBtn" title="Thème"></button>
-      <button class="icon-btn" id="rename" title="Changer de pseudo"><svg class="ic"><use href="#i-user"/></svg></button>
+      <button class="icon-btn" id="logoutBtn" title="Se déconnecter"><svg class="ic"><use href="#i-logout"/></svg></button>
     </div>
   </aside>
   <div class="backdrop" id="backdrop"></div>
@@ -82,6 +84,7 @@
     </header>
     <div class="msgs" id="msgs"></div>
     <button class="newpill" id="newPill" hidden><svg class="ic"><use href="#i-down"/></svg><span></span></button>
+    <div class="keywait" id="keyWait" hidden></div>
     <div class="composer-wrap" id="mainComposer"></div>
     <div class="drop"><div><svg class="ic"><use href="#i-upload"/></svg>Déposer pour envoyer</div></div>
   </main>
@@ -128,14 +131,32 @@
 </div>
 
 <div class="modal welcome" id="loginModal" hidden>
-  <form class="card" id="loginForm">
+  <form class="card" id="loginForm" autocomplete="on">
     <div class="avatar-preview" id="avPreview">?</div>
     <h3>Bienvenue sur LAN Chat</h3>
-    <p>Le chat du bureau, directement sur le réseau local. Choisis un pseudo pour commencer.</p>
-    <div class="field"><span>@</span><input id="loginName" maxlength="32" placeholder="ton_pseudo" autocomplete="off" required></div>
-    <button class="btn primary">Entrer dans le chat</button>
-    <small>Rien ne sort du réseau du bureau.</small>
+    <p>Le chat du bureau, chiffré de bout en bout.</p>
+    <div class="tabs" id="authTabs">
+      <button type="button" data-mode="login" class="on">Se connecter</button>
+      <button type="button" data-mode="register">Créer un compte</button>
+    </div>
+    <div class="field"><span>@</span><input id="loginName" name="username" maxlength="32" placeholder="ton_pseudo" autocomplete="username" required></div>
+    <div class="field"><svg class="ic"><use href="#i-lock"/></svg><input id="loginPass" name="password" type="password" placeholder="Mot de passe" autocomplete="current-password" required></div>
+    <div class="field reg-only" hidden><svg class="ic"><use href="#i-lock"/></svg><input id="loginPass2" type="password" placeholder="Confirme le mot de passe" autocomplete="new-password"></div>
+    <div class="field reg-only" hidden><svg class="ic"><use href="#i-key"/></svg><input id="loginCode" placeholder="Code d'accès du bureau" autocomplete="off"></div>
+    <p class="reg-only auth-note" hidden>⚠️ Ton mot de passe protège aussi ta clé de chiffrement : <b>s'il est perdu, tes anciens messages privés le sont aussi.</b> Personne, pas même l'administrateur, ne peut le récupérer.</p>
+    <div class="auth-error" id="authError" hidden></div>
+    <button class="btn primary" id="authBtn">Se connecter</button>
+    <small>🔒 Tes messages sont chiffrés dans ton navigateur : le serveur ne peut pas les lire.</small>
   </form>
+</div>
+
+<div class="modal welcome" id="insecure" hidden>
+  <div class="card">
+    <div class="avatar-preview" style="background:#e5484d"><svg class="ic" style="width:30px;height:30px"><use href="#i-lock"/></svg></div>
+    <h3>Connexion non sécurisée</h3>
+    <p>Le chiffrement de bout en bout ne fonctionne qu'en HTTPS. Ouvre la version sécurisée du chat ; si le navigateur affiche un avertissement de certificat, clique sur « Paramètres avancés » puis « Continuer ».</p>
+    <a class="btn primary" id="httpsLink" style="display:block;text-decoration:none">Ouvrir la version sécurisée</a>
+  </div>
 </div>
 
 <div class="modal" id="channelModal" hidden>
@@ -157,6 +178,7 @@
 <canvas id="confetti" hidden></canvas>
 
 <script src="emoji.js"></script>
+<script src="crypto.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

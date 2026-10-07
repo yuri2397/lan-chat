@@ -1,0 +1,17 @@
+# Déploiement Dokploy en mode « Docker Compose » (voir README, section Déployer sur Dokploy).
+# Le domaine et le certificat HTTPS se configurent dans l'onglet « Domains » de Dokploy (port du conteneur : 3000).
+# Aucun port n'est publié sur l'hôte : tout passe par Traefik, en HTTPS.
+services:
+  lanchat:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Code demandé pour créer un compte. Vide = généré au premier démarrage et affiché dans les logs.
+      LANCHAT_CODE: ${LANCHAT_CODE:-}
+    volumes:
+      - lanchat-data:/data
+    expose:
+      - "3000"
+
+volumes:
+  lanchat-data:
