@@ -9,7 +9,7 @@
 // - Canal : clé AES-GCM aléatoire, distribuée à chaque membre chiffrée via ECDH(expéditeur, destinataire) + HKDF.
 // - Chaque chiffrement AES-GCM utilise un IV aléatoire et le nom du canal comme données authentifiées (AAD),
 //   pour qu'un message ne puisse pas être déplacé d'un canal à l'autre.
-const E2E = (() => {
+export const E2E = (() => {
   const te = new TextEncoder(), td = new TextDecoder();
   const subtle = window.crypto && crypto.subtle;
   const CURVE = { name: 'ECDH', namedCurve: 'P-256' };

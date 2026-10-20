@@ -5,7 +5,10 @@
 // renégociation, donc instantané. Qui partage est signalé à part (signal « screen » ou état de la salle).
 //
 // Ce module gère la capture, le débit, et le panneau qui affiche les écrans reçus.
-const Screen = (() => {
+import { esc, icon } from '../lib/dom.js';
+import { nameOf } from '../core/state.js';
+
+export const Screen = (() => {
   const supported = () => !!navigator.mediaDevices?.getDisplayMedia;
 
   async function capture() {
@@ -37,8 +40,8 @@ const Screen = (() => {
   view.hidden = true;
   view.innerHTML = `<div class="sv-head">
       <span class="sv-title"></span><span class="sv-tabs"></span>
-      <button class="icon-btn" data-sv="full" title="Plein écran">${icon('maximize')}</button>
-      <button class="icon-btn" data-sv="min" title="Réduire / agrandir">${icon('minimize')}</button>
+      <button type="button" class="icon-btn" data-sv="full" title="Plein écran" aria-label="Plein écran">${icon('maximize')}</button>
+      <button type="button" class="icon-btn" data-sv="min" title="Réduire / agrandir" aria-label="Réduire ou agrandir">${icon('minimize')}</button>
     </div>
     <video autoplay playsinline muted></video>`;
   document.body.appendChild(view);
@@ -69,9 +72,9 @@ const Screen = (() => {
     const track = sources.get(current);
     if (video.srcObject?.getVideoTracks()[0] !== track) video.srcObject = new MediaStream([track]);
     video.play().catch(() => {});
-    view.querySelector('.sv-title').textContent = `🖥 Écran de ${current}`;
+    view.querySelector('.sv-title').textContent = `Écran de ${nameOf(current)}`;
     view.querySelector('.sv-tabs').innerHTML = sources.size > 1
-      ? [...sources.keys()].map(u => `<button class="sv-tab${u === current ? ' on' : ''}" data-sv-user="${esc(u)}">${esc(u)}</button>`).join('')
+      ? [...sources.keys()].map(u => `<button class="sv-tab${u === current ? ' on' : ''}" data-sv-user="${esc(u)}">${esc(nameOf(u))}</button>`).join('')
       : '';
   }
   view.addEventListener('click', e => {

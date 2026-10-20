@@ -11,7 +11,8 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
-COPY server.js db.js ./
+COPY server.js ./
+COPY server ./server
 COPY public ./public
 
 # /data contient les fichiers envoyés (chiffrés) — et la base SQLite si DATABASE_URL n'est pas définie.

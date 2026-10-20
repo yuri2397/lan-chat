@@ -5,8 +5,22 @@
 // - Celui qui arrive envoie une offre à chacun des présents ; les présents répondent. Pas de collision possible.
 // - Les SDP sont chiffrés avec la clé du canal, et liés à l'appel, à l'expéditeur et au destinataire.
 // - Celui qui démarre l'appel écrit « a démarré un appel » dans le canal ; le dernier à partir écrit la durée.
-const Huddle = (() => {
-  let rooms = {};  // canal -> salle telle que décrite par le serveur
+import { $, esc, icon } from '../lib/dom.js';
+import { fmtDur } from '../lib/format.js';
+import { blip } from '../lib/sound.js';
+import { E2E } from '../lib/e2e.js';
+import { state, bus, nameOf, label } from '../core/state.js';
+import { api, beacon } from '../core/api.js';
+import { keyFor, ensureChannelKey } from '../core/keys.js';
+import { DEVICE_ID } from '../core/device.js';
+import { openConvo } from '../core/router.js';
+import { toast } from '../ui/layer.js';
+import { avatarHtml } from '../ui/avatar.js';
+import { Screen } from './screen.js';
+import { Call } from './call.js';
+
+export const Huddle = (() => {
+  const rooms = state.rooms; // canal -> salle telle que décrite par le serveur (partagé avec l'interface)
   let h = null;    // appel en cours : { channel, roomId, startedAt, stream, muted, peers: Map(user -> { deviceId, pc, audio, speaking }) }
   let iceServers = null;
 
@@ -47,7 +61,7 @@ const Huddle = (() => {
     };
     peer.pc.onconnectionstatechange = () => {
       if (peer.pc.connectionState === 'failed' && h?.peers.get(user) === peer) {
-        toast(`Connexion audio impossible avec ${user}`);
+        toast(`Connexion audio impossible avec ${nameOf(user)}`);
         closePeer(user);
       }
       render();
@@ -77,7 +91,7 @@ const Huddle = (() => {
 
   // ---------- Rejoindre / quitter ----------
   async function join(channel) {
-    if (h) return h.channel === channel ? null : toast(`Tu es déjà dans l'appel de #${h.channel}`);
+    if (h) return h.channel === channel ? null : toast(`Tu es déjà dans l’appel de #${h.channel}`);
     if (Call.active()) return toast('Termine d\'abord ton appel en cours');
     if (!window.RTCPeerConnection || !navigator.mediaDevices?.getUserMedia) return toast('Les appels ne sont pas pris en charge par ce navigateur.');
     await ensureChannelKey(channel).catch(() => {});
@@ -94,7 +108,7 @@ const Huddle = (() => {
       blip(true);
       const others = room.members.filter(m => m.user !== me());
       if (!others.length && room.startedBy === me()) postTrace(channel, { kind: 'group', status: 'started' });
-      for (const m of others) offerTo(m.user, m.deviceId).catch(() => toast(`Impossible de joindre ${m.user}`));
+      for (const m of others) offerTo(m.user, m.deviceId).catch(() => toast(`Impossible de joindre ${nameOf(m.user)}`));
     } catch (err) {
       toast(err.message);
       teardown();
@@ -170,16 +184,12 @@ const Huddle = (() => {
   // Fermeture de l'onglet : le serveur nous retire de la salle à la coupure du flux ; on prévient quand même.
   window.addEventListener('pagehide', () => {
     if (!h) return;
-    fetch('/api/huddle/leave', {
-      method: 'POST', keepalive: true,
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + state.token },
-      body: JSON.stringify({ channel: h.channel, deviceId: DEVICE_ID }),
-    }).catch(() => {});
+    beacon('/api/huddle/leave', { channel: h.channel, deviceId: DEVICE_ID });
   });
 
   // ---------- Événements serveur ----------
   function setRooms(list) {
-    rooms = {};
+    for (const k of Object.keys(rooms)) delete rooms[k];
     for (const r of list || []) if (r) rooms[r.channel] = r;
     if (h && !inRoom(rooms[h.channel], me(), DEVICE_ID)) teardown(); // reconnexion : la salle nous a oubliés
     renderChannelUi();
@@ -189,9 +199,9 @@ const Huddle = (() => {
     if (room) rooms[channel] = room; else delete rooms[channel];
     // Quelqu'un démarre un appel : on prévient (sans sonnerie)
     if (!before && room && room.startedBy !== me() && !h) {
-      toast(`🔊 ${room.startedBy} a démarré un appel dans #${channel} — clique pour rejoindre`, () => { openChannel(channel); join(channel); });
+      toast(`${nameOf(room.startedBy)} a démarré un appel dans ${label(channel)}`, { action: 'Rejoindre', onAction: () => { openConvo(channel); join(channel); } });
       if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
-        new Notification(`🔊 Appel de groupe dans #${channel}`, { body: `${room.startedBy} a démarré un appel`, tag: 'lanchat-huddle-' + channel }).onclick = () => { window.focus(); openChannel(channel); };
+        new Notification(`Appel de groupe dans ${label(channel)}`, { body: `${nameOf(room.startedBy)} a démarré un appel`, tag: 'lanchat-huddle-' + channel }).onclick = () => { window.focus(); openConvo(channel); };
       }
     }
     if (h && h.channel === channel) {
@@ -247,21 +257,6 @@ const Huddle = (() => {
       }, 150);
     } catch {}
   }
-  function blip(up) {
-    if (!state.sound) return;
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator(), g = ctx.createGain(), t = ctx.currentTime;
-      o.frequency.setValueAtTime(up ? 520 : 780, t);
-      o.frequency.exponentialRampToValueAtTime(up ? 780 : 520, t + 0.15);
-      g.gain.setValueAtTime(0.0001, t);
-      g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
-      o.connect(g).connect(ctx.destination);
-      o.start(t); o.stop(t + 0.25);
-      setTimeout(() => ctx.close(), 400);
-    } catch {}
-  }
 
   // ---------- Interface ----------
   const ui = document.createElement('div');
@@ -274,18 +269,21 @@ const Huddle = (() => {
     const people = [me(), ...h.peers.keys()];
     const avatars = people.map(u => {
       const peer = h.peers.get(u);
-      const cls = (u === me() ? (h.muted ? ' muted' : '') : peer?.speaking ? ' speaking' : '') + (peer && peer.pc.connectionState !== 'connected' ? ' pending' : '');
-      return `<span class="hu-av${cls}" style="background:${colorOf(u)}" title="${esc(u)}${u === me() ? ' (toi)' : ''}">${initial(u)}</span>`;
+      const cls = (u === me() ? (h.muted ? ' muted-av' : '') : peer?.speaking ? ' speaking' : '') + (peer && peer.pc.connectionState !== 'connected' ? ' pending' : '');
+      return avatarHtml(u, { cls: cls.trim(), attrs: ` title="${esc(nameOf(u))}${u === me() ? ' (toi)' : ''}"` });
     }).join('');
     const status = h.joining ? 'Connexion…' : fmtDur(Date.now() - (h.startedAt || Date.now()));
     const canShare = Screen.supported() && !h.joining;
     ui.className = 'call-bar huddle-bar active';
-    ui.innerHTML = `<div class="hu-icon">🔊</div>
-      <div class="call-info"><div class="call-name">#${esc(h.channel)}</div><div class="call-status">${status} · ${people.length} participant${people.length > 1 ? 's' : ''}</div></div>
+    const tip = t => `title="${t}" aria-label="${t}"`;
+    ui.innerHTML = `<div class="call-head"><div class="call-info"><div class="call-name">${icon('headphones', 'sm')} ${esc(label(h.channel))}</div><div class="call-status">${status} · ${people.length} participant${people.length > 1 ? 's' : ''}</div></div></div>
       <div class="hu-avs">${avatars}</div>
-      ${canShare ? `<button class="call-btn small${h.screenTrack ? ' sharing' : ''}" data-huddle="screen" title="${h.screenTrack ? 'Arrêter le partage d\'écran' : 'Partager mon écran'}">${icon('screen')}</button>` : ''}
-      <button class="call-btn small${h.muted ? ' muted' : ''}" data-huddle="mute" title="${h.muted ? 'Réactiver le micro' : 'Couper le micro'}">${icon(h.muted ? 'mic-off' : 'mic')}</button>
-      <button class="call-btn small decline" data-huddle="leave" title="Quitter l'appel">${icon('phone-off')}</button>`;
+      <div class="call-row">
+        <button type="button" class="call-btn small${h.muted ? ' muted' : ''}" data-huddle="mute" ${tip(h.muted ? 'Réactiver le micro' : 'Couper le micro')}>${icon(h.muted ? 'mic-off' : 'mic')}</button>
+        ${canShare ? `<button type="button" class="call-btn small${h.screenTrack ? ' sharing' : ''}" data-huddle="screen" ${tip(h.screenTrack ? 'Arrêter le partage d’écran' : 'Partager mon écran')}>${icon('screen')}</button>` : ''}
+        <span class="call-spacer"></span>
+        <button type="button" class="call-btn small decline wide" data-huddle="leave" ${tip('Quitter l’appel')}>${icon('phone-off')}</button>
+      </div>`;
     if (!h.joining) clock = setInterval(() => { const s = ui.querySelector('.call-status'); if (s && h) s.textContent = `${fmtDur(Date.now() - h.startedAt)} · ${people.length} participant${people.length > 1 ? 's' : ''}`; }, 1000);
   }
   ui.addEventListener('click', e => {
@@ -293,27 +291,8 @@ const Huddle = (() => {
     if (b) ({ mute: toggleMute, leave, screen: toggleScreen })[b.dataset.huddle]?.();
   });
 
-  // Bandeau « appel en cours » en haut du canal affiché, et marque 🔊 dans la barre latérale
-  function renderChannelUi() {
-    const banner = $('#huddleBanner');
-    const ch = state.current;
-    const room = state.view === 'channel' && !isDm(ch) ? roomOf(ch) : null;
-    if (!room) { banner.hidden = true; banner.innerHTML = ''; }
-    else {
-      const mine = h?.channel === ch;
-      banner.hidden = false;
-      banner.innerHTML = `<span class="hb-dot"></span><span class="hb-text"><b>Appel en cours</b> · ${room.members.length}/8</span>
-        <span class="hb-avs">${room.members.map(m => `<span class="hu-av" style="background:${colorOf(m.user)}" title="${esc(m.user)}">${initial(m.user)}</span>`).join('')}</span>
-        ${mine ? '<span class="hb-in">Tu es dans l\'appel</span>' : `<button class="btn-sm hb-join" data-huddle-join="${esc(ch)}">Rejoindre</button>`}`;
-    }
-    if (typeof renderSidebar === 'function' && state.me) renderSidebar();
-    // Les traces « a démarré un appel » affichent « Rejoindre » seulement tant que l'appel existe
-    document.querySelectorAll('.msg').forEach(el => { if (el._msg?.call?.kind === 'group' && el._msg.call.status === 'started') refreshMsg(el._msg); });
-  }
-  document.addEventListener('click', e => {
-    const b = e.target.closest('[data-huddle-join]');
-    if (b) join(b.dataset.huddleJoin);
-  });
+  // L'interface (bandeau du canal, barre latérale, traces « a démarré un appel ») se met à jour sur cet événement
+  function renderChannelUi() { bus.emit('rooms'); }
 
   return {
     join, leave, setRooms, onRoom, onSignal, renderChannelUi,

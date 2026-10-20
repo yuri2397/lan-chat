@@ -6,7 +6,19 @@
 // pas remplacer les empreintes DTLS pour s'intercaler dans l'appel. L'identifiant d'appel est inclus dans le
 // chiffré pour qu'une ancienne offre ne puisse pas être rejouée.
 // Seul l'appelant écrit la trace de l'appel dans la conversation (« Appel audio · 3 min », « Appel manqué »).
-const Call = (() => {
+import { esc, icon } from '../lib/dom.js';
+import { fmtDur } from '../lib/format.js';
+import { Tones } from '../lib/sound.js';
+import { E2E } from '../lib/e2e.js';
+import { state, bus, nameOf } from '../core/state.js';
+import { api, beacon } from '../core/api.js';
+import { keyFor } from '../core/keys.js';
+import { toast } from '../ui/layer.js';
+import { avatarHtml } from '../ui/avatar.js';
+import { Screen } from './screen.js';
+import { Huddle } from './huddle.js';
+
+export const Call = (() => {
   const deviceId = crypto.randomUUID();
   const RING_TIMEOUT = 45000;
   let call = null; // { id, peer, role: 'caller'|'callee', state: 'calling'|'ringing'|'connecting'|'active'|'reconnecting', pc, stream, remoteAudio, startedAt, muted, … }
@@ -85,8 +97,8 @@ const Call = (() => {
   async function start(peer) {
     if (call || Huddle.active()) return toast('Un appel est déjà en cours');
     if (!window.RTCPeerConnection || !navigator.mediaDevices?.getUserMedia) return toast('Les appels ne sont pas pris en charge par ce navigateur.');
-    if (!state.users.has(peer)) return toast(`${peer} n'a pas de compte`);
-    if (!state.online.includes(peer)) return toast(`${peer} est hors ligne : impossible de l'appeler pour l'instant.`);
+    if (!state.users.has(peer)) return toast(`${peer} n’a pas de compte`);
+    if (!state.online.has(peer)) return toast(`${nameOf(peer)} est hors ligne : impossible de l’appeler pour l’instant.`);
     const c = call = { id: crypto.randomUUID(), peer, role: 'caller', state: 'calling', remoteAudio: new Audio() };
     c.remoteAudio.play().catch(() => {}); // débloque la lecture audio pendant le clic
     render();
@@ -101,7 +113,7 @@ const Call = (() => {
       if (call !== c) return;
       const { delivered } = await signal(peer, 'offer', c.id, await encSdp(peer, c.pc.localDescription, c.id));
       if (call !== c) return;
-      if (!delivered) { toast(`${peer} vient de se déconnecter.`); return end('missed'); }
+      if (!delivered) { toast(`${nameOf(peer)} vient de se déconnecter.`); return end('missed'); }
       Tones.ringback();
       c.timeout = setTimeout(() => { if (call === c && c.state === 'calling') { signal(peer, 'cancel', c.id).catch(() => {}); end('missed'); } }, RING_TIMEOUT);
     } catch (err) {
@@ -214,12 +226,12 @@ const Call = (() => {
         break;
       case 'decline':
         if (!mine) return;
-        toast(`${d.from} a refusé l'appel`);
+        toast(`${nameOf(d.from)} a refusé l’appel`);
         end('declined');
         break;
       case 'busy':
         if (!mine) return;
-        toast(`${d.from} est déjà en ligne`);
+        toast(`${nameOf(d.from)} est déjà en ligne`);
         end('busy');
         break;
       case 'cancel':
@@ -273,11 +285,7 @@ const Call = (() => {
     const c = call;
     if (!c) return;
     const kind = c.role === 'callee' && c.state === 'ringing' ? 'decline' : c.role === 'caller' && c.state === 'calling' ? 'cancel' : 'hangup';
-    fetch('/api/call', {
-      method: 'POST', keepalive: true,
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + state.token },
-      body: JSON.stringify({ to: c.peer, kind, callId: c.id, deviceId }),
-    }).catch(() => {});
+    beacon('/api/call', { to: c.peer, kind, callId: c.id, deviceId });
   });
 
   // ---------- Niveau sonore de l'autre (halo quand il parle) ----------
@@ -297,42 +305,15 @@ const Call = (() => {
     } catch {}
   }
 
-  // ---------- Sonneries (générées, aucun fichier audio) ----------
-  const Tones = (() => {
-    let ctx, timer;
-    const beep = (freqs, dur, vol) => {
-      ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
-      ctx.resume().catch(() => {});
-      const t = ctx.currentTime;
-      for (const f of freqs) {
-        const o = ctx.createOscillator(), g = ctx.createGain();
-        o.frequency.value = f;
-        g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
-        g.gain.setValueAtTime(vol, t + dur - 0.05);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-        o.connect(g).connect(ctx.destination);
-        o.start(t); o.stop(t + dur + 0.05);
-      }
-    };
-    function loop(fn, every) { stop(); fn(); timer = setInterval(fn, every); }
-    function stop() { clearInterval(timer); timer = null; }
-    return {
-      ring: () => loop(() => { beep([880, 1320], 0.18, 0.2); setTimeout(() => beep([880, 1320], 0.18, 0.2), 260); }, 2000),
-      ringback: () => loop(() => beep([440, 480], 1, 0.05), 4000),
-      stop,
-    };
-  })();
-
   // ---------- Notification d'appel entrant ----------
   let titleTimer = null, titleBefore = '';
   function notifyIncoming(from) {
     stopTitleFlash();
     titleBefore = document.title;
     let on = false;
-    titleTimer = setInterval(() => { on = !on; document.title = on ? `📞 Appel de ${from}` : titleBefore; }, 1000);
+    titleTimer = setInterval(() => { on = !on; document.title = on ? `📞 Appel de ${nameOf(from)}` : titleBefore; }, 1000);
     if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
-      const n = new Notification(`📞 Appel audio de ${from}`, { body: 'Clique pour répondre', tag: 'lanchat-call', requireInteraction: true });
+      const n = new Notification(`Appel audio de ${nameOf(from)}`, { body: 'Clique pour répondre', tag: 'lanchat-call', requireInteraction: true });
       n.onclick = () => { window.focus(); n.close(); };
     }
   }
@@ -341,7 +322,7 @@ const Call = (() => {
     clearInterval(titleTimer);
     titleTimer = null;
     document.title = titleBefore;
-    renderSidebar(); // recalcule le titre avec le nombre de non-lus
+    bus.emit('unread'); // recalcule le titre avec le nombre de non-lus
   }
 
   // ---------- Interface ----------
@@ -353,15 +334,15 @@ const Call = (() => {
     clearInterval(clock);
     const c = call;
     if (!c) { ui.innerHTML = ''; ui.className = ''; return; }
-    const avatar = `<div class="call-avatar" style="background:${colorOf(c.peer)}">${initial(c.peer)}</div>`;
+    const avatar = avatarHtml(c.peer, { cls: 'call-avatar' });
     if (c.role === 'callee' && c.state === 'ringing') {
       ui.className = 'call-incoming';
       ui.innerHTML = `<div class="call-card">
-        ${avatar}<div class="call-kind">Appel audio entrant</div><div class="call-name">${esc(c.peer)}</div>
+        ${avatar}<div class="call-kind">Appel audio entrant</div><div class="call-name">${esc(nameOf(c.peer))}</div>
         <div class="call-actions">
-          <button class="call-btn decline" data-call="decline" title="Refuser">${icon('phone-off')}</button>
-          <button class="call-btn accept" data-call="accept" title="Accepter">${icon('phone')}</button>
-        </div><div class="call-note">🔒 Chiffré de bout en bout</div></div>`;
+          <button type="button" class="call-btn decline" data-call="decline" title="Refuser" aria-label="Refuser">${icon('phone-off')}</button>
+          <button type="button" class="call-btn accept" data-call="accept" title="Accepter" aria-label="Accepter">${icon('phone')}</button>
+        </div><div class="call-note">${icon('lock')}Chiffré de bout en bout</div></div>`;
       return;
     }
     const status = {
@@ -370,11 +351,15 @@ const Call = (() => {
     }[c.state];
     const canShare = Screen.supported() && c.videoTx && c.state === 'active';
     ui.className = 'call-bar' + (c.state === 'active' ? ' active' : '');
-    ui.innerHTML = `${avatar}
-      <div class="call-info"><div class="call-name">${esc(c.peer)}</div><div class="call-status">${status}</div></div>
-      ${canShare ? `<button class="call-btn small${c.screenTrack ? ' sharing' : ''}" data-call="screen" title="${c.screenTrack ? 'Arrêter le partage d\'écran' : 'Partager mon écran'}">${icon('screen')}</button>` : ''}
-      <button class="call-btn small${c.muted ? ' muted' : ''}" data-call="mute" title="${c.muted ? 'Réactiver le micro' : 'Couper le micro'}" ${c.stream ? '' : 'disabled'}>${icon(c.muted ? 'mic-off' : 'mic')}</button>
-      <button class="call-btn small decline" data-call="hangup" title="Raccrocher">${icon('phone-off')}</button>`;
+    const tip = t => `title="${t}" aria-label="${t}"`;
+    ui.innerHTML = `<div class="call-head">${avatar}
+        <div class="call-info"><div class="call-name">${esc(nameOf(c.peer))}</div><div class="call-status">${status}</div></div></div>
+      <div class="call-row">
+        <button type="button" class="call-btn small${c.muted ? ' muted' : ''}" data-call="mute" ${tip(c.muted ? 'Réactiver le micro' : 'Couper le micro')} ${c.stream ? '' : 'disabled'}>${icon(c.muted ? 'mic-off' : 'mic')}</button>
+        ${canShare ? `<button type="button" class="call-btn small${c.screenTrack ? ' sharing' : ''}" data-call="screen" ${tip(c.screenTrack ? 'Arrêter le partage d’écran' : 'Partager mon écran')}>${icon('screen')}</button>` : ''}
+        <span class="call-spacer"></span>
+        <button type="button" class="call-btn small decline wide" data-call="hangup" ${tip('Raccrocher')}>${icon('phone-off')}</button>
+      </div>`;
     if (c.state === 'active') clock = setInterval(() => { const s = ui.querySelector('.call-status'); if (s && call === c) s.textContent = fmtDur(Date.now() - c.startedAt) + (c.screenTrack ? ' · tu partages ton écran' : c.peerSharing ? ' · écran partagé' : ''); }, 1000);
   }
   ui.addEventListener('click', e => {

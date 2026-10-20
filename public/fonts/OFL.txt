@@ -1,0 +1,4 @@
+Atkinson Hyperlegible Next & Atkinson Hyperlegible Mono
+Copyright 2020-2024 The Atkinson Hyperlegible Next Project Authors (Braille Institute of America)
+Distribuées sous licence SIL Open Font License 1.1 : https://openfontlicense.org
+(sous-ensemble « latin » de Google Fonts)

@@ -1,0 +1,9 @@
+{
+  "name": "LAN Chat",
+  "short_name": "LAN Chat",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#10302a",
+  "theme_color": "#10302a",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

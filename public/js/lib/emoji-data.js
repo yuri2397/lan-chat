@@ -1,5 +1,5 @@
 // Catalogue d'emoji : "emoji|mot-clé,mot-clé" (mots-clés en français + quelques équivalents anglais pour :shortcodes:)
-const EMOJI_CATS = [
+export const EMOJI_CATS = [
   ['Smileys', `😀|sourire,grin 😃|content,smiley 😄|rire,smile 😁|dents,grin 😆|mdr,laugh 😅|sueur,sweat 😂|lol,joy 🤣|ptdr,rofl
     🙂|ok,slight 🙃|ironie,upside 😉|clin,wink 😊|timide,blush 😇|ange,innocent 🥰|amour,love 😍|coeur,heart_eyes 🤩|wow,star_struck
     😘|bisou,kiss 😋|miam,yum 😛|langue,tongue 😜|fou,crazy 🤪|zinzin,zany 🤑|argent,money 🤗|calin,hug 🤭|oups,giggle
@@ -26,7 +26,7 @@ const EMOJI_CATS = [
     🍗|poulet,chicken 🍚|riz,rice 🥭|mangue,mango 🍉|pasteque,watermelon 🍰|gateau,cake 🍫|chocolat ⚽|foot,soccer 🏀|basket
     🎮|jeu,game 🎵|musique,music 🎬|film,movie 🏖️|plage,vacances,beach ✈️|avion,voyage,plane 🌞|soleil,sun 🌧️|pluie,rain 🌙|nuit,moon`],
 ];
-const EMOJIS = [];
+export const EMOJIS = [];
 for (const [cat, list] of EMOJI_CATS) {
   for (const entry of list.trim().split(/\s+/)) {
     const [ch, kws] = entry.split('|');
